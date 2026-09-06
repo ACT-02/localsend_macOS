@@ -12,6 +12,8 @@ permissions:
 env:
   FLUTTER_VERSION: "3.41.9"
   RUST_VERSION: "1.97.1"
+
+  # Target system.
   LEGACY_MACOS_TARGET: "10.13"
   MACOSX_DEPLOYMENT_TARGET: "10.13"
 
@@ -80,31 +82,41 @@ jobs:
 
           echo
           echo "============================================================"
-          echo "macOS runner"
+          echo "Runner"
           echo "============================================================"
           sw_vers
           uname -a
           uname -m
 
           echo
-          echo "High Sierra target: ${LEGACY_MACOS_TARGET}"
+          echo "Target macOS: ${LEGACY_MACOS_TARGET}"
+          echo "Target architecture: x86_64"
 
 
       # ============================================================
-      # Flutter / Rust dependencies
+      # Dependencies
       # ============================================================
 
       - name: Clean Flutter build
         working-directory: app
-        run: flutter clean
+        shell: bash
+        run: |
+          set -euxo pipefail
+          flutter clean
 
       - name: Flutter pub get
         working-directory: app
-        run: flutter pub get
+        shell: bash
+        run: |
+          set -euxo pipefail
+          flutter pub get
 
       - name: Prepare Cargokit
         working-directory: packages/localsend_isolates/rust_builder/cargokit/build_tool
-        run: flutter pub get
+        shell: bash
+        run: |
+          set -euxo pipefail
+          flutter pub get
 
       - name: Verify Rust workspace
         shell: bash
@@ -120,13 +132,14 @@ jobs:
             --no-deps \
             > /tmp/cargo-metadata.json
 
-          python3 - <<'PY'
+          python3 <<'PY'
           import json
 
           with open("/tmp/cargo-metadata.json", "r") as f:
               metadata = json.load(f)
 
           print("Rust workspace packages:")
+
           for package in metadata["packages"]:
               print(f"  {package['name']} {package['version']}")
               print(f"    {package['manifest_path']}")
@@ -146,33 +159,28 @@ jobs:
           PODFILE="app/macos/Podfile"
           RELEASE_XCCONFIG="app/macos/Runner/Configs/Release.xcconfig"
           APP_DELEGATE="app/macos/Runner/AppDelegate.swift"
-          PACKAGE_RESOLVED="app/macos/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 
           echo "============================================================"
-          echo "Patching LocalSend for macOS High Sierra 10.13"
-          echo "Architecture: x86_64"
+          echo "LocalSend macOS High Sierra backport"
+          echo "Target: macOS 10.13 / x86_64"
           echo "============================================================"
 
 
-          # --------------------------------------------------------
-          # 1. Patch Xcode project
+          # ========================================================
+          # 1. Xcode project
           #
-          # Flutter 3.41.9 contains a migration which changes literal
+          # Flutter 3.41.9 explicitly migrates literal:
           #
-          #     MACOSX_DEPLOYMENT_TARGET = 10.13;
+          #   MACOSX_DEPLOYMENT_TARGET = 10.13;
           #
-          # back to:
+          # back to 10.15.
           #
-          #     MACOSX_DEPLOYMENT_TARGET = 10.15;
+          # So all pbxproj deployment targets use an indirect
+          # variable instead:
           #
-          # Therefore do NOT put a literal 10.13 in the pbxproj.
+          #   $(LOCALSEND_LEGACY_MACOS_TARGET)
           #
-          # Use:
-          #
-          #     $(LOCALSEND_LEGACY_MACOS_TARGET)
-          #
-          # instead.
-          # --------------------------------------------------------
+          # ========================================================
 
           python3 <<'PY'
           from pathlib import Path
@@ -181,8 +189,9 @@ jobs:
           pbx = Path("app/macos/Runner.xcodeproj/project.pbxproj")
           text = pbx.read_text()
 
+
           # --------------------------------------------------------
-          # Deployment target
+          # Deployment targets
           # --------------------------------------------------------
 
           text = re.sub(
@@ -193,7 +202,10 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Remove upstream Apple Developer signing
+          # Signing
+          #
+          # Remove LocalSend upstream developer identity.
+          # GitHub CI uses ad-hoc signing.
           # --------------------------------------------------------
 
           text = re.sub(
@@ -234,24 +246,20 @@ jobs:
 
 
           # --------------------------------------------------------
-          # DockProgress backport
+          # DockProgress
           #
-          # Current LocalSend:
-          #     DockProgress >= 4.3.1
+          # Current LocalSend requests >= 4.3.1.
           #
-          # DockProgress 4.x requires a newer macOS.
-          #
-          # DockProgress 3.2.0 still supports macOS 10.12 and retains
-          # the APIs LocalSend currently uses:
-          #
-          #     DockProgress.style
-          #     DockProgress.progress
-          #
+          # Backport to 3.2.0, whose deployment target remains
+          # compatible with High Sierra.
           # --------------------------------------------------------
 
-          dock_regex = re.compile(
+          dock_pattern = re.compile(
               r'('
-              r'XCRemoteSwiftPackageReference "DockProgress".*?'
+              r'XCRemoteSwiftPackageReference "DockProgress" \*/ = \{'
+              r'.*?'
+              r'repositoryURL = "https://github\.com/sindresorhus/DockProgress";'
+              r'.*?'
               r'requirement = \{'
               r')'
               r'.*?'
@@ -259,25 +267,25 @@ jobs:
               re.DOTALL,
           )
 
-          match = dock_regex.search(text)
+          match = dock_pattern.search(text)
 
           if not match:
               raise SystemExit(
                   "ERROR: Could not locate DockProgress package requirement."
               )
 
-          replacement = (
+          new_requirement = (
               match.group(1)
-              + '''
-                  kind = exactVersion;
-                  version = 3.2.0;
-          '''
+              + "\n"
+              + "\t\t\t\tkind = exactVersion;\n"
+              + "\t\t\t\tversion = 3.2.0;\n"
+              + "\t\t\t"
               + match.group(2)
           )
 
           text = (
               text[:match.start()]
-              + replacement
+              + new_requirement
               + text[match.end():]
           )
 
@@ -285,18 +293,12 @@ jobs:
           PY
 
 
-          # --------------------------------------------------------
-          # 2. Patch the REAL Release xcconfig
+          # ========================================================
+          # 2. Actual Release xcconfig
           #
-          # This is:
-          #
-          # app/macos/Runner/Configs/Release.xcconfig
-          #
-          # NOT app/macos/Flutter/Release.xcconfig.
-          #
-          # Project-level settings inherited by Runner,
-          # ShareExtension and Swift Package build graph.
-          # --------------------------------------------------------
+          # This is the Release configuration actually inherited by
+          # the Xcode project.
+          # ========================================================
 
           cat >> "$RELEASE_XCCONFIG" <<'EOF'
 
@@ -307,12 +309,12 @@ jobs:
           LOCALSEND_LEGACY_MACOS_TARGET = 10.13
           MACOSX_DEPLOYMENT_TARGET = $(LOCALSEND_LEGACY_MACOS_TARGET)
 
-          // High Sierra is Intel-only.
+          // High Sierra has no Apple Silicon support.
           ARCHS = x86_64
           EXCLUDED_ARCHS = arm64
           ONLY_ACTIVE_ARCH = YES
 
-          // CI / local legacy build uses ad-hoc signing.
+          // CI ad-hoc signing.
           CODE_SIGN_IDENTITY = -
           CODE_SIGN_STYLE = Manual
           DEVELOPMENT_TEAM =
@@ -320,19 +322,18 @@ jobs:
           EOF
 
 
-          # --------------------------------------------------------
-          # 3. Patch CocoaPods
+          # ========================================================
+          # 3. CocoaPods
           #
-          # Again, do not write:
+          # Do NOT use:
           #
-          #     platform :osx, '10.13'
+          #   platform :osx, '10.13'
           #
-          # because Flutter 3.41.9 detects that exact string and
-          # automatically rewrites it to 10.15.
+          # because Flutter recognizes that literal and migrates it.
           #
-          # Ruby variable defeats that migration while CocoaPods still
-          # receives 10.13.
-          # --------------------------------------------------------
+          # Using a Ruby variable still gives CocoaPods 10.13 while
+          # avoiding Flutter's textual migration.
+          # ========================================================
 
           python3 <<'PY'
           from pathlib import Path
@@ -341,14 +342,10 @@ jobs:
           podfile = Path("app/macos/Podfile")
           text = podfile.read_text()
 
-          # Replace:
-          #
-          # platform :osx, '11.0'
-          #
-          # with:
-          #
-          # legacy_macos_target = '10.13'
-          # platform :osx, legacy_macos_target
+
+          # --------------------------------------------------------
+          # Global platform
+          # --------------------------------------------------------
 
           text = re.sub(
               r"^platform\s+:osx,\s*['\"][0-9.]+['\"]",
@@ -360,7 +357,10 @@ jobs:
           )
 
 
-          # Replace the hard-coded Pod deployment target.
+          # --------------------------------------------------------
+          # Every generated Pod target
+          # --------------------------------------------------------
+
           text = re.sub(
               r"config\.build_settings\[['\"]MACOSX_DEPLOYMENT_TARGET['\"]\]"
               r"\s*=\s*['\"][0-9.]+['\"]",
@@ -371,14 +371,17 @@ jobs:
 
 
           # --------------------------------------------------------
-          # ShareExtension compiles Runner/Shared.swift.
+          # ShareExtension
           #
-          # Shared.swift imports Defaults, so ShareExtension needs a
-          # proper CocoaPods target containing Defaults too.
+          # Runner/Shared.swift is also compiled as part of
+          # ShareExtension and imports Defaults.
+          #
+          # Therefore ShareExtension needs an explicit CocoaPods
+          # target which links Defaults.
           # --------------------------------------------------------
 
           if "target 'ShareExtension' do" not in text:
-              share_extension = r"""
+              share_target = """
           target 'ShareExtension' do
             use_frameworks!
             use_modular_headers!
@@ -390,7 +393,7 @@ jobs:
 
               text = text.replace(
                   "\npost_install do |installer|",
-                  "\n" + share_extension + "post_install do |installer|",
+                  "\n" + share_target + "post_install do |installer|",
                   1,
               )
 
@@ -403,13 +406,9 @@ jobs:
           PY
 
 
-          # --------------------------------------------------------
-          # 4. Remove @MainActor from LocalSend native glue
-          #
-          # This method itself contains no async/await/Task work.
-          # Avoid introducing a Swift Concurrency runtime dependency
-          # into a High Sierra build.
-          # --------------------------------------------------------
+          # ========================================================
+          # 4. Avoid unnecessary Swift Concurrency dependency.
+          # ========================================================
 
           python3 <<'PY'
           from pathlib import Path
@@ -426,21 +425,28 @@ jobs:
           PY
 
 
-          # --------------------------------------------------------
-          # 5. Force SwiftPM to resolve DockProgress 3.2.0 instead of
-          # the committed 4.3.1 resolution.
-          # --------------------------------------------------------
+          # ========================================================
+          # 5. Remove BOTH committed SwiftPM resolution files.
+          #
+          # Xcode may use either the project workspace or the outer
+          # Runner workspace depending on how package resolution is
+          # invoked.
+          #
+          # Do not assume where Xcode will recreate Package.resolved.
+          # ========================================================
 
-          rm -f "$PACKAGE_RESOLVED"
+          rm -f \
+            app/macos/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+            app/macos/Runner.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 
-          # --------------------------------------------------------
-          # Diagnostics
-          # --------------------------------------------------------
+          # ========================================================
+          # Patch diagnostics
+          # ========================================================
 
           echo
           echo "============================================================"
-          echo "Xcode deployment settings after patch"
+          echo "Deployment-target settings"
           echo "============================================================"
 
           grep -nE \
@@ -450,7 +456,7 @@ jobs:
 
           echo
           echo "============================================================"
-          echo "Signing settings after patch"
+          echo "Signing settings"
           echo "============================================================"
 
           grep -nE \
@@ -474,7 +480,7 @@ jobs:
 
           echo
           echo "============================================================"
-          echo "DockProgress package reference"
+          echo "DockProgress"
           echo "============================================================"
 
           grep -A12 -B2 \
@@ -484,7 +490,7 @@ jobs:
 
           echo
           echo "============================================================"
-          echo "AppDelegate MainActor check"
+          echo "AppDelegate"
           echo "============================================================"
 
           grep -n \
@@ -494,7 +500,7 @@ jobs:
 
 
       # ============================================================
-      # Validate patch before touching Xcode
+      # Static validation
       # ============================================================
 
       - name: Validate High Sierra patch
@@ -505,148 +511,75 @@ jobs:
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
           PODFILE="app/macos/Podfile"
 
-          # Upstream certificate must be gone.
+          echo "============================================================"
+          echo "Validate upstream signing removal"
+          echo "============================================================"
+
           if grep -q "3W7H4PYMCV" "$PBX"; then
-            echo "ERROR: Upstream LocalSend Team ID still exists."
+            echo "ERROR: Upstream LocalSend Team ID remains:"
             grep -n "3W7H4PYMCV" "$PBX"
             exit 1
           fi
 
-          # Flutter migrator-triggering literal must not exist.
+
+          echo
+          echo "============================================================"
+          echo "Validate Flutter migration bypass"
+          echo "============================================================"
+
           if grep -q 'MACOSX_DEPLOYMENT_TARGET = 10.13;' "$PBX"; then
-            echo "ERROR: Literal 10.13 exists in pbxproj."
-            echo "Flutter 3.41.9 would migrate it back to 10.15."
+            echo "ERROR: Literal 10.13 exists in project.pbxproj."
+            echo "Flutter 3.41.9 would migrate this to 10.15."
             exit 1
           fi
 
           if grep -q "platform :osx, '10.13'" "$PODFILE"; then
             echo "ERROR: Literal 10.13 exists in Podfile."
-            echo "Flutter 3.41.9 would migrate it back to 10.15."
+            echo "Flutter 3.41.9 would migrate this to 10.15."
             exit 1
           fi
 
-          # DockProgress 4.x must be gone.
-          if grep -A8 \
-            'XCRemoteSwiftPackageReference "DockProgress"' \
-            "$PBX" \
-            | grep -q '4.3.1'; then
-            echo "ERROR: DockProgress 4.3.1 is still configured."
-            exit 1
-          fi
 
-          # ShareExtension must now have a Pods target.
+          echo
+          echo "============================================================"
+          echo "Validate DockProgress backport"
+          echo "============================================================"
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          text = Path(
+              "app/macos/Runner.xcodeproj/project.pbxproj"
+          ).read_text()
+
+          if "version = 3.2.0;" not in text:
+              raise SystemExit(
+                  "ERROR: DockProgress 3.2.0 requirement was not written."
+              )
+
+          print("DockProgress requirement is 3.2.0.")
+          PY
+
+
+          echo
+          echo "============================================================"
+          echo "Validate ShareExtension CocoaPods target"
+          echo "============================================================"
+
           if ! grep -q "target 'ShareExtension' do" "$PODFILE"; then
-            echo "ERROR: ShareExtension CocoaPods target missing."
+            echo "ERROR: ShareExtension CocoaPods target is absent."
             exit 1
           fi
 
+          echo
           echo "Static patch validation passed."
 
 
       # ============================================================
-      # CocoaPods
-      # ============================================================
-
-      - name: Install CocoaPods dependencies
-        working-directory: app/macos
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          pod install
-
-          echo
-          echo "============================================================"
-          echo "Generated CocoaPods targets"
-          echo "============================================================"
-
-          find "Pods/Target Support Files" \
-            -maxdepth 1 \
-            -type d \
-            -print \
-            | sort
-
-          echo
-          echo "============================================================"
-          echo "ShareExtension Pods integration"
-          echo "============================================================"
-
-          test -d "Pods/Target Support Files/Pods-ShareExtension"
-
-          find "Pods/Target Support Files/Pods-ShareExtension" \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort
-
-
-      # ============================================================
-      # Resolve Swift Package dependencies
-      # ============================================================
-
-      - name: Resolve Swift packages
-        working-directory: app
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          xcodebuild \
-            -resolvePackageDependencies \
-            -workspace macos/Runner.xcworkspace \
-            -scheme Runner
-
-          PACKAGE_RESOLVED="macos/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
-
-          echo
-          echo "============================================================"
-          echo "Resolved Swift packages"
-          echo "============================================================"
-
-          cat "$PACKAGE_RESOLVED"
-
-          python3 <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path(
-              "macos/Runner.xcodeproj/project.xcworkspace/"
-              "xcshareddata/swiftpm/Package.resolved"
-          )
-
-          data = json.loads(path.read_text())
-
-          versions = {}
-
-          for pin in data.get("pins", []):
-              identity = pin.get("identity")
-              version = pin.get("state", {}).get("version")
-              versions[identity] = version
-
-          print("Resolved package versions:")
-          for name, version in versions.items():
-              print(f"  {name}: {version}")
-
-          dock = versions.get("dockprogress")
-
-          if dock != "3.2.0":
-              raise SystemExit(
-                  f"ERROR: DockProgress resolved to {dock!r}, expected 3.2.0"
-              )
-
-          launch = versions.get("launchatlogin-legacy")
-
-          if launch != "5.0.2":
-              print(
-                  "WARNING: LaunchAtLogin-Legacy resolved to "
-                  f"{launch!r}; expected current LocalSend version 5.0.2."
-              )
-          PY
-
-
-      # ============================================================
-      # Let Flutter generate its normal macOS configuration.
+      # Flutter configuration
       #
-      # This deliberately runs AFTER our migration-safe patches.
+      # This runs Flutter's normal project migrations, generates
+      # xcconfig files and runs CocoaPods without compiling the app.
       # ============================================================
 
       - name: Generate Flutter macOS configuration
@@ -663,10 +596,10 @@ jobs:
 
 
       # ============================================================
-      # Make sure Flutter did not silently restore Catalina.
+      # Make sure Flutter did not rewrite us to Catalina.
       # ============================================================
 
-      - name: Verify Flutter did not migrate target
+      - name: Verify Flutter migration bypass
         shell: bash
         run: |
           set -euxo pipefail
@@ -675,19 +608,17 @@ jobs:
           PODFILE="app/macos/Podfile"
 
           echo "============================================================"
-          echo "Check source files after flutter --config-only"
+          echo "Checking project after Flutter --config-only"
           echo "============================================================"
 
           if grep -q 'MACOSX_DEPLOYMENT_TARGET = 10.15;' "$PBX"; then
-            echo "ERROR:"
-            echo "Flutter restored a literal macOS 10.15 deployment target:"
+            echo "ERROR: Flutter restored literal macOS 10.15."
             grep -n 'MACOSX_DEPLOYMENT_TARGET = 10.15;' "$PBX"
             exit 1
           fi
 
           if grep -q "platform :osx, '10.15'" "$PODFILE"; then
-            echo "ERROR:"
-            echo "Flutter restored Podfile platform to macOS 10.15:"
+            echo "ERROR: Flutter restored Podfile to macOS 10.15."
             grep -n "platform :osx, '10.15'" "$PODFILE"
             exit 1
           fi
@@ -696,7 +627,187 @@ jobs:
 
 
       # ============================================================
-      # Inspect the settings Xcode ACTUALLY sees.
+      # Verify CocoaPods integration after Flutter generated it.
+      # ============================================================
+
+      - name: Verify ShareExtension CocoaPods integration
+        working-directory: app/macos
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "============================================================"
+          echo "Generated CocoaPods targets"
+          echo "============================================================"
+
+          find "Pods/Target Support Files" \
+            -maxdepth 1 \
+            -type d \
+            -print \
+            | sort
+
+          echo
+          echo "============================================================"
+          echo "ShareExtension"
+          echo "============================================================"
+
+          if [ ! -d "Pods/Target Support Files/Pods-ShareExtension" ]; then
+            echo "ERROR: Pods-ShareExtension was not generated."
+            exit 1
+          fi
+
+          find "Pods/Target Support Files/Pods-ShareExtension" \
+            -maxdepth 1 \
+            -type f \
+            -print \
+            | sort
+
+
+      # ============================================================
+      # Swift Package Manager
+      #
+      # IMPORTANT:
+      #
+      # Package.resolved is intentionally NOT assigned to one fixed
+      # path. Xcode has both:
+      #
+      #   Runner.xcworkspace
+      #
+      # and:
+      #
+      #   Runner.xcodeproj/project.xcworkspace
+      #
+      # available in this project.
+      #
+      # Resolve first, then locate whatever Package.resolved Xcode
+      # actually created.
+      # ============================================================
+
+      - name: Resolve Swift packages
+        working-directory: app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "============================================================"
+          echo "Resolve Swift packages"
+          echo "============================================================"
+
+          xcodebuild \
+            -resolvePackageDependencies \
+            -workspace macos/Runner.xcworkspace \
+            -scheme Runner \
+            2>&1 | tee ../swiftpm-resolve.log
+
+
+          echo
+          echo "============================================================"
+          echo "Locate Package.resolved dynamically"
+          echo "============================================================"
+
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+
+          macos = Path("macos")
+
+          files = sorted(
+              p
+              for p in macos.rglob("Package.resolved")
+              if p.parent.name == "swiftpm"
+          )
+
+          if not files:
+              print(
+                  "ERROR: xcodebuild resolved the package graph, "
+                  "but no Package.resolved exists under app/macos."
+              )
+              raise SystemExit(1)
+
+
+          print(
+              f"Found {len(files)} Package.resolved file(s):"
+          )
+
+          for path in files:
+              print(f"  {path}")
+
+
+          print()
+          print("============================================================")
+          print("Resolved package contents")
+          print("============================================================")
+
+
+          active_files = []
+
+          for path in files:
+              print()
+              print("------------------------------------------------------------")
+              print(path)
+              print("------------------------------------------------------------")
+
+              raw = path.read_text()
+              print(raw)
+
+              try:
+                  data = json.loads(raw)
+              except Exception as exc:
+                  print(f"WARNING: unable to parse {path}: {exc}")
+                  continue
+
+              versions = {}
+
+              for pin in data.get("pins", []):
+                  identity = pin.get("identity", "")
+                  version = pin.get("state", {}).get("version")
+                  versions[identity] = version
+
+              if "dockprogress" in versions:
+                  active_files.append((path, versions))
+
+
+          if not active_files:
+              raise SystemExit(
+                  "ERROR: No Package.resolved contains DockProgress."
+              )
+
+
+          print()
+          print("============================================================")
+          print("Validate package versions")
+          print("============================================================")
+
+          for path, versions in active_files:
+              dock = versions.get("dockprogress")
+              launch = versions.get("launchatlogin-legacy")
+
+              print()
+              print(f"File: {path}")
+              print(f"  DockProgress: {dock}")
+              print(f"  LaunchAtLogin-Legacy: {launch}")
+
+              if dock != "3.2.0":
+                  raise SystemExit(
+                      f"ERROR: {path}: DockProgress resolved to "
+                      f"{dock!r}; expected '3.2.0'."
+                  )
+
+              if launch != "5.0.2":
+                  raise SystemExit(
+                      f"ERROR: {path}: LaunchAtLogin-Legacy resolved "
+                      f"to {launch!r}; expected '5.0.2'."
+                  )
+
+
+          print()
+          print("SwiftPM resolution is correct.")
+          PY
+
+
+      # ============================================================
+      # Verify settings Xcode REALLY sees.
       # ============================================================
 
       - name: Verify effective Xcode build settings
@@ -719,9 +830,10 @@ jobs:
             > ../diagnostics/runner-build-settings.txt
 
           grep -E \
-            '(^| )[A-Z_]*(ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|LOCALSEND_LEGACY_MACOS_TARGET)[A-Z_]* =' \
+            'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|LOCALSEND_LEGACY_MACOS_TARGET' \
             ../diagnostics/runner-build-settings.txt \
             || true
+
 
           echo
           echo "============================================================"
@@ -736,9 +848,10 @@ jobs:
             > ../diagnostics/shareextension-build-settings.txt
 
           grep -E \
-            '(^| )[A-Z_]*(ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|LOCALSEND_LEGACY_MACOS_TARGET)[A-Z_]* =' \
+            'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|LOCALSEND_LEGACY_MACOS_TARGET' \
             ../diagnostics/shareextension-build-settings.txt \
             || true
+
 
           echo
           echo "============================================================"
@@ -749,24 +862,28 @@ jobs:
           from pathlib import Path
           import re
 
+
           files = [
               Path("../diagnostics/runner-build-settings.txt"),
               Path("../diagnostics/shareextension-build-settings.txt"),
           ]
 
+
           for path in files:
               text = path.read_text()
 
+              print()
               print(f"Checking {path}")
 
-              deployment = re.findall(
-                  r"^\s*MACOSX_DEPLOYMENT_TARGET\s*=\s*(.+?)\s*$",
+
+              deployments = re.findall(
+                  r"^\s*MACOSX_DEPLOYMENT_TARGET\s*=\s*(.*?)\s*$",
                   text,
                   flags=re.MULTILINE,
               )
 
               archs = re.findall(
-                  r"^\s*ARCHS\s*=\s*(.+?)\s*$",
+                  r"^\s*ARCHS\s*=\s*(.*?)\s*$",
                   text,
                   flags=re.MULTILINE,
               )
@@ -777,35 +894,54 @@ jobs:
                   flags=re.MULTILINE,
               )
 
-              print("  deployment:", deployment[:3])
-              print("  archs:", archs[:3])
-              print("  excluded:", excluded[:3])
 
-              if not deployment or deployment[0] != "10.13":
+              print("  MACOSX_DEPLOYMENT_TARGET:", deployments[:3])
+              print("  ARCHS:", archs[:3])
+              print("  EXCLUDED_ARCHS:", excluded[:3])
+
+
+              if not deployments:
                   raise SystemExit(
-                      f"ERROR: {path} is not targeting macOS 10.13"
+                      f"ERROR: {path}: no deployment target."
                   )
 
-              if not archs or "x86_64" not in archs[0].split():
+              if deployments[0] != "10.13":
                   raise SystemExit(
-                      f"ERROR: {path} is not building x86_64"
+                      f"ERROR: {path}: deployment target is "
+                      f"{deployments[0]!r}, expected '10.13'."
                   )
 
-              if excluded and "arm64" not in excluded[0].split():
+
+              if not archs:
                   raise SystemExit(
-                      f"ERROR: {path} does not exclude arm64"
+                      f"ERROR: {path}: ARCHS is absent."
                   )
 
-          print("Effective Xcode settings are correct.")
+              if "x86_64" not in archs[0].split():
+                  raise SystemExit(
+                      f"ERROR: {path}: ARCHS does not contain x86_64."
+                  )
+
+
+              if excluded:
+                  if "arm64" not in excluded[0].split():
+                      raise SystemExit(
+                          f"ERROR: {path}: arm64 is not excluded."
+                      )
+
+
+          print()
+          print("Effective Xcode build settings are correct.")
           PY
 
 
       # ============================================================
       # Build
       #
-      # rust_lib_localsend_app is intentionally NOT built by a
-      # separate cargo build step. Cargokit builds it through the
-      # Flutter/Xcode native build.
+      # No manual cargo build here.
+      #
+      # rust_lib_localsend_app is compiled by Cargokit as part of
+      # Flutter/Xcode's native build.
       # ============================================================
 
       - name: Build macOS app
@@ -820,11 +956,11 @@ jobs:
           echo "============================================================"
           echo "Building LocalSend"
           echo
-          echo "Target OS:      macOS High Sierra 10.13"
-          echo "Architecture:   x86_64"
-          echo "Flutter:        ${FLUTTER_VERSION}"
-          echo "Rust:           ${RUST_VERSION}"
-          echo "DockProgress:   3.2.0"
+          echo "Target OS:       macOS High Sierra 10.13"
+          echo "Architecture:    x86_64"
+          echo "Flutter:         ${FLUTTER_VERSION}"
+          echo "Rust:            ${RUST_VERSION}"
+          echo "DockProgress:    3.2.0"
           echo "============================================================"
 
           flutter build macos \
@@ -834,7 +970,7 @@ jobs:
 
 
       # ============================================================
-      # Locate final application
+      # Locate application
       # ============================================================
 
       - name: Locate built application
@@ -875,7 +1011,7 @@ jobs:
 
 
       # ============================================================
-      # Verify final architecture
+      # Architecture check
       # ============================================================
 
       - name: Verify x86_64 application
@@ -886,29 +1022,38 @@ jobs:
 
           MAIN="$APP/Contents/MacOS/$APP_EXECUTABLE"
 
+          echo "============================================================"
+          echo "Main executable"
+          echo "============================================================"
+
           file "$MAIN"
+
+          echo
           lipo -info "$MAIN"
 
           ARCHES="$(lipo -archs "$MAIN")"
 
+          echo
           echo "Architectures: $ARCHES"
 
+
           if ! echo "$ARCHES" | grep -qw x86_64; then
-            echo "ERROR: Main application does not contain x86_64."
+            echo "ERROR: Main application lacks x86_64."
             exit 1
           fi
 
+
           if echo "$ARCHES" | grep -qw arm64; then
-            echo "ERROR: arm64 unexpectedly remains in main executable."
+            echo "ERROR: arm64 unexpectedly remains in the app."
             exit 1
           fi
 
 
       # ============================================================
-      # Audit every Mach-O binary
+      # Audit every Mach-O.
       #
-      # This is where we will discover whether FlutterMacOS.framework
-      # or a plugin still has a minimum OS newer than High Sierra.
+      # The app itself saying 10.13 does not prove its embedded
+      # Flutter engine/plugins are High Sierra compatible.
       # ============================================================
 
       - name: Audit Mach-O deployment targets
@@ -927,6 +1072,7 @@ jobs:
           while IFS= read -r -d '' FILE; do
 
             if file "$FILE" | grep -q "Mach-O"; then
+
               {
                 echo
                 echo "============================================================"
@@ -969,13 +1115,14 @@ jobs:
                 otool -L "$FILE" || true
 
               } | tee -a "$REPORT"
+
             fi
 
           done
 
 
       # ============================================================
-      # Separate linked-library report
+      # Linked-library audit
       # ============================================================
 
       - name: Audit linked libraries
@@ -987,12 +1134,14 @@ jobs:
           mkdir -p ../diagnostics
 
           REPORT="../diagnostics/linked-libraries.txt"
+
           : > "$REPORT"
 
           find "$APP" -type f -print0 |
           while IFS= read -r -d '' FILE; do
 
             if file "$FILE" | grep -q "Mach-O"; then
+
               {
                 echo
                 echo "============================================================"
@@ -1000,6 +1149,7 @@ jobs:
                 echo "============================================================"
                 otool -L "$FILE" || true
               } >> "$REPORT"
+
             fi
 
           done
@@ -1008,14 +1158,14 @@ jobs:
 
 
       # ============================================================
-      # Inspect signatures and entitlements
+      # Signatures / entitlements
       #
-      # Do NOT run:
+      # Do NOT blindly run:
       #
-      #     codesign --deep --force
+      #   codesign --deep --force
       #
-      # over the final bundle. That could destroy nested extension
-      # entitlements. Xcode has already ad-hoc signed each target.
+      # over the completed application, because doing that can
+      # overwrite nested ShareExtension entitlements.
       # ============================================================
 
       - name: Inspect code signatures
@@ -1053,6 +1203,7 @@ jobs:
 
             find "$APP" -type d -name '*.appex' -print |
             while read -r EXTENSION; do
+
               echo
               echo "------------------------------------------------------------"
               echo "$EXTENSION"
@@ -1065,13 +1216,15 @@ jobs:
                 --entitlements :- \
                 "$EXTENSION" \
                 2>&1 || true
+
             done
 
           } | tee "$REPORT"
 
+
           echo
           echo "============================================================"
-          echo "Verify complete bundle"
+          echo "Verify bundle"
           echo "============================================================"
 
           codesign \
@@ -1106,12 +1259,13 @@ jobs:
             "$APP" \
             "$OUTPUT"
 
+          echo
           echo "Created:"
           ls -lh "$OUTPUT"
 
 
       # ============================================================
-      # Upload final build
+      # Upload build
       # ============================================================
 
       - name: Upload High Sierra build
@@ -1124,43 +1278,100 @@ jobs:
 
 
       # ============================================================
-      # Diagnostics are uploaded even if compilation fails.
+      # Diagnostics
+      #
+      # Always run these even if compilation failed.
       # ============================================================
 
       - name: Collect source diagnostics
         if: always()
         shell: bash
         run: |
+          set +e
+
           mkdir -p diagnostics
+
 
           cp \
             app/macos/Runner.xcodeproj/project.pbxproj \
             diagnostics/project.pbxproj.after-patch \
-            2>/dev/null || true
+            2>/dev/null
+
 
           cp \
             app/macos/Podfile \
             diagnostics/Podfile.after-patch \
-            2>/dev/null || true
+            2>/dev/null
+
 
           cp \
             app/macos/Runner/Configs/Release.xcconfig \
             diagnostics/Release.xcconfig.after-patch \
-            2>/dev/null || true
+            2>/dev/null
+
+
+          # --------------------------------------------------------
+          # Collect every Package.resolved dynamically.
+          #
+          # No fixed Xcode workspace path here.
+          # --------------------------------------------------------
+
+          python3 <<'PY'
+          from pathlib import Path
+          import shutil
+
+
+          source = Path("app/macos")
+          destination = Path("diagnostics")
+
+          destination.mkdir(parents=True, exist_ok=True)
+
+
+          files = sorted(
+              p
+              for p in source.rglob("Package.resolved")
+              if p.parent.name == "swiftpm"
+          )
+
+
+          for index, path in enumerate(files, start=1):
+              relative = path.relative_to(source)
+
+              safe_name = str(relative).replace("/", "__")
+
+              output = destination / (
+                  f"Package.resolved.{index}__{safe_name}"
+              )
+
+              shutil.copy2(path, output)
+
+              print(f"Copied {path} -> {output}")
+          PY
+
 
           cp \
-            app/macos/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
-            diagnostics/Package.resolved.after-patch \
-            2>/dev/null || true
+            swiftpm-resolve.log \
+            diagnostics/swiftpm-resolve.log \
+            2>/dev/null
+
+
+          cp \
+            flutter-config-only.log \
+            diagnostics/flutter-config-only.log \
+            2>/dev/null
+
+
+          cp \
+            flutter-macos-build.log \
+            diagnostics/flutter-macos-build.log \
+            2>/dev/null
+
 
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: LocalSend-High-Sierra-build-diagnostics
-          path: |
-            flutter-config-only.log
-            flutter-macos-build.log
-            diagnostics/
+          path: diagnostics/
           if-no-files-found: warn
           retention-days: 30
