@@ -4,128 +4,179 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - high-sierra
+      - main
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+  FLUTTER_VERSION: "3.41.9"
 
 jobs:
   build:
     runs-on: macos-15-intel
 
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "10.13"
-
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Setup Flutter
+        uses: flutter-actions/setup-flutter@v4
+        with:
+          version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Setup Flutter
-      uses: subosito/flutter-action@v2
-      with:
-        channel: stable
-        cache: true
+      - name: Show toolchains
+        run: |
+          flutter --version
+          dart --version
+          rustc --version
+          cargo --version
+          xcodebuild -version
+          uname -a
 
+      - name: Flutter dependencies
+        working-directory: app
+        run: flutter pub get
 
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
+      - name: Cargokit dependencies
+        working-directory: packages/localsend_isolates/rust_builder/cargokit/build_tool
+        run: flutter pub get
 
+      - name: Patch macOS deployment target
+        run: |
+          echo "Patching LocalSend for macOS 10.13..."
 
-    - name: Flutter pub get
-      working-directory: app
-      run: |
-        flutter --version
-        flutter pub get
+          # Runner Xcode project
+          sed -i '' -E \
+            's/MACOSX_DEPLOYMENT_TARGET = [0-9.]+;/MACOSX_DEPLOYMENT_TARGET = 10.13;/g' \
+            app/macos/Runner.xcodeproj/project.pbxproj
 
+          # CocoaPods global platform
+          sed -i '' \
+            "s/platform :osx, '11.0'/platform :osx, '10.13'/g" \
+            app/macos/Podfile
 
-    - name: Patch macOS deployment target
-      working-directory: app
-      run: |
+          # CocoaPods post_install override
+          sed -i '' \
+            "s/config.build_settings\['MACOSX_DEPLOYMENT_TARGET'\] = '11.0'/config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '10.13'/g" \
+            app/macos/Podfile
 
-        echo "Patching deployment targets"
+          # Make sure Flutter/Xcode release configuration also sees 10.13.
+          printf '\nMACOSX_DEPLOYMENT_TARGET = 10.13\n' \
+            >> app/macos/Flutter/Release.xcconfig
 
-        find . \
-        -name "*.pbxproj" \
-        -o -name "*.xcconfig" \
-        -o -name "Podfile" \
-        | xargs sed -i '' \
-        's/10\.[0-9][0-9]*/10.13/g'
+          echo "---- Remaining deployment target references ----"
+          grep -RIn \
+            "MACOSX_DEPLOYMENT_TARGET\|platform :osx" \
+            app/macos \
+            packages/localsend_isolates/rust_builder/macos \
+            || true
 
-        find . \
-        -type f \
-        -name "*.pbxproj" \
-        -exec sed -i '' \
-        's/MACOSX_DEPLOYMENT_TARGET = [0-9.]*/MACOSX_DEPLOYMENT_TARGET = 10.13/g' {} \;
+      - name: Verify Rust crate
+        run: |
+          echo "Rust workspace:"
+          cat Cargo.toml
 
+          echo
+          echo "Flutter Rust crate:"
+          cat packages/localsend_isolates/rust/Cargo.toml
 
-    - name: Patch Flutter generated configs
-      working-directory: app
-      run: |
+          echo
+          echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
 
-        mkdir -p macos/Flutter
+      - name: Build macOS app
+        working-directory: app
+        run: |
+          flutter build macos \
+            --release \
+            -v
 
-        echo "
-        MACOSX_DEPLOYMENT_TARGET = 10.13
-        " >> macos/Flutter/Release.xcconfig
+      - name: Find built application
+        working-directory: app
+        run: |
+          APP="$(find build/macos/Build/Products/Release \
+            -maxdepth 1 \
+            -name '*.app' \
+            -print \
+            -quit)"
 
+          if [ -z "$APP" ]; then
+            echo "No .app bundle found"
+            exit 1
+          fi
 
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "Built application: $APP"
 
-    - name: Build Rust backend
-      working-directory: app
-      run: |
+      - name: Scan Mach-O deployment targets
+        working-directory: app
+        run: |
+          echo "Scanning every Mach-O binary in:"
+          echo "$APP"
+          echo
 
-        cargo build \
-        --release \
-        --manifest-path rust/Cargo.toml
+          find "$APP" -type f -print0 |
+          while IFS= read -r -d '' FILE; do
+            if file "$FILE" | grep -q "Mach-O"; then
+              echo
+              echo "============================================================"
+              echo "$FILE"
+              echo "============================================================"
 
+              otool -l "$FILE" |
+                awk '
+                  /LC_VERSION_MIN_MACOSX/ {
+                    show=1
+                    count=0
+                  }
+                  /LC_BUILD_VERSION/ {
+                    show=1
+                    count=0
+                  }
+                  show {
+                    print
+                    count++
+                    if (count >= 8) show=0
+                  }
+                '
+            fi
+          done
 
-    - name: Build macOS app
-      working-directory: app
-      run: |
+      - name: Ad-hoc sign application
+        working-directory: app
+        run: |
+          codesign \
+            --force \
+            --deep \
+            --sign - \
+            "$APP"
 
-        flutter build macos \
-        --release \
-        -v
+          codesign \
+            --verify \
+            --deep \
+            --strict \
+            --verbose=2 \
+            "$APP"
 
+      - name: Package
+        working-directory: app
+        run: |
+          rm -rf release
+          mkdir -p release
 
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            "$APP" \
+            release/LocalSend-macOS-High-Sierra-x86_64.zip
 
-    - name: Scan minimum macOS version
-      working-directory: app
-      run: |
-
-        APP=$(find build/macos -name "*.app" | head -1)
-
-        echo "$APP"
-
-        otool -l \
-        "$APP/Contents/MacOS/"* \
-        | grep -A3 LC_BUILD_VERSION || true
-
-
-
-    - name: Package
-      working-directory: app
-      run: |
-
-        mkdir release
-
-        cp -R \
-        build/macos/Build/Products/Release/*.app \
-        release/
-
-
-        cd release
-
-        zip -r \
-        LocalSend-High-Sierra.zip \
-        *.app
-
-
-
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-
-        name: LocalSend-High-Sierra
-
-        path:
-          app/release/LocalSend-High-Sierra.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalSend-macOS-High-Sierra-x86_64
+          path: app/release/LocalSend-macOS-High-Sierra-x86_64.zip
+          if-no-files-found: error
