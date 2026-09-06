@@ -1,0 +1,131 @@
+name: LocalSend macOS High Sierra Backport
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - high-sierra
+
+jobs:
+  build:
+    runs-on: macos-13
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        channel: stable
+        cache: true
+
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+
+    - name: Flutter pub get
+      working-directory: app
+      run: |
+        flutter --version
+        flutter pub get
+
+
+    - name: Patch macOS deployment target
+      working-directory: app
+      run: |
+
+        echo "Patching deployment targets"
+
+        find . \
+        -name "*.pbxproj" \
+        -o -name "*.xcconfig" \
+        -o -name "Podfile" \
+        | xargs sed -i '' \
+        's/10\.[0-9][0-9]*/10.13/g'
+
+        find . \
+        -type f \
+        -name "*.pbxproj" \
+        -exec sed -i '' \
+        's/MACOSX_DEPLOYMENT_TARGET = [0-9.]*/MACOSX_DEPLOYMENT_TARGET = 10.13/g' {} \;
+
+
+    - name: Patch Flutter generated configs
+      working-directory: app
+      run: |
+
+        mkdir -p macos/Flutter
+
+        echo "
+        MACOSX_DEPLOYMENT_TARGET = 10.13
+        " >> macos/Flutter/Release.xcconfig
+
+
+
+    - name: Build Rust backend
+      working-directory: app
+      run: |
+
+        cargo build \
+        --release \
+        --manifest-path rust/Cargo.toml
+
+
+    - name: Build macOS app
+      working-directory: app
+      run: |
+
+        flutter build macos \
+        --release \
+        -v
+
+
+
+    - name: Scan minimum macOS version
+      working-directory: app
+      run: |
+
+        APP=$(find build/macos -name "*.app" | head -1)
+
+        echo "$APP"
+
+        otool -l \
+        "$APP/Contents/MacOS/"* \
+        | grep -A3 LC_BUILD_VERSION || true
+
+
+
+    - name: Package
+      working-directory: app
+      run: |
+
+        mkdir release
+
+        cp -R \
+        build/macos/Build/Products/Release/*.app \
+        release/
+
+
+        cd release
+
+        zip -r \
+        LocalSend-High-Sierra.zip \
+        *.app
+
+
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+
+        name: LocalSend-High-Sierra
+
+        path:
+          app/release/LocalSend-High-Sierra.zip
