@@ -12,6 +12,7 @@ permissions:
 env:
   FLUTTER_VERSION: "3.41.9"
   RUST_VERSION: "1.97.1"
+
   LEGACY_MACOS_TARGET: "10.13"
   MACOSX_DEPLOYMENT_TARGET: "10.13"
 
@@ -70,6 +71,7 @@ jobs:
           echo "============================================================"
           rustc --version
           cargo --version
+          rustup show
 
           echo
           echo "============================================================"
@@ -86,11 +88,196 @@ jobs:
           uname -m
 
           echo
-          echo "Target: macOS ${LEGACY_MACOS_TARGET} / x86_64"
+          echo "Target:"
+          echo "  macOS ${LEGACY_MACOS_TARGET}"
+          echo "  x86_64"
 
 
       # ============================================================
-      # Flutter / Rust dependencies
+      # Remove StoreKit / IAP from the legacy macOS build
+      #
+      # This mirrors LocalSend's own FOSS build mechanism.
+      #
+      # We implement it in Python rather than executing
+      # remove_proprietary_dependencies.sh because that upstream
+      # script uses GNU-style `sed -i`, while GitHub's macOS runner
+      # uses BSD sed.
+      # ============================================================
+
+      - name: Remove in-app purchases for High Sierra
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+
+          # --------------------------------------------------------
+          # pubspec.yaml
+          #
+          # Remove:
+          #
+          #   in_app_purchase: ... # [FOSS_REMOVE]
+          # --------------------------------------------------------
+
+          pubspec = Path("app/pubspec.yaml")
+
+          lines = pubspec.read_text().splitlines()
+
+          new_lines = [
+              line
+              for line in lines
+              if "# [FOSS_REMOVE]" not in line
+          ]
+
+          if len(new_lines) == len(lines):
+              raise SystemExit(
+                  "ERROR: No # [FOSS_REMOVE] dependency "
+                  "was found in app/pubspec.yaml."
+              )
+
+          pubspec.write_text(
+              "\n".join(new_lines) + "\n"
+          )
+
+
+          # --------------------------------------------------------
+          # Convert FOSS_REMOVE regions to block comments.
+          #
+          # This mirrors:
+          #
+          #   // [FOSS_REMOVE_START] -> /*
+          #   // [FOSS_REMOVE_END]   -> */
+          # --------------------------------------------------------
+
+          dart_files = [
+              Path("app/lib/config/init.dart"),
+              Path(
+                  "app/lib/pages/donation/"
+                  "donation_page.dart"
+              ),
+              Path(
+                  "app/lib/pages/donation/"
+                  "donation_page_vm.dart"
+              ),
+          ]
+
+          for path in dart_files:
+              text = path.read_text()
+
+              if "// [FOSS_REMOVE_START]" not in text:
+                  raise SystemExit(
+                      f"ERROR: FOSS start marker missing: {path}"
+                  )
+
+              if "// [FOSS_REMOVE_END]" not in text:
+                  raise SystemExit(
+                      f"ERROR: FOSS end marker missing: {path}"
+                  )
+
+              text = text.replace(
+                  "// [FOSS_REMOVE_START]",
+                  "/*",
+              )
+
+              text = text.replace(
+                  "// [FOSS_REMOVE_END]",
+                  "*/",
+              )
+
+              path.write_text(text)
+
+
+          # --------------------------------------------------------
+          # Remove purchase provider completely.
+          # --------------------------------------------------------
+
+          purchase_provider = Path(
+              "app/lib/provider/purchase_provider.dart"
+          )
+
+          if not purchase_provider.exists():
+              raise SystemExit(
+                  "ERROR: purchase_provider.dart was not found."
+              )
+
+          purchase_provider.unlink()
+
+
+          # --------------------------------------------------------
+          # Donation page now uses LocalSend's built-in noop VM.
+          # --------------------------------------------------------
+
+          donation_page = Path(
+              "app/lib/pages/donation/donation_page.dart"
+          )
+
+          text = donation_page.read_text()
+
+          text = text.replace(
+              "donationPageVmProvider",
+              "donationPageNoopVmProvider",
+          )
+
+          donation_page.write_text(text)
+
+
+          # --------------------------------------------------------
+          # Validation
+          # --------------------------------------------------------
+
+          pubspec_text = pubspec.read_text()
+
+          if "in_app_purchase:" in pubspec_text:
+              raise SystemExit(
+                  "ERROR: in_app_purchase remains in pubspec.yaml."
+              )
+
+          if purchase_provider.exists():
+              raise SystemExit(
+                  "ERROR: purchase_provider.dart still exists."
+              )
+
+          print(
+              "LocalSend proprietary purchase code "
+              "removed for legacy macOS build."
+          )
+          PY
+
+
+          # Force CocoaPods to regenerate the lockfile without
+          # in_app_purchase_storekit.
+          rm -f app/macos/Podfile.lock
+
+
+          echo
+          echo "============================================================"
+          echo "pubspec purchase check"
+          echo "============================================================"
+
+          grep -n \
+            'in_app_purchase' \
+            app/pubspec.yaml \
+            || true
+
+          echo
+          echo "============================================================"
+          echo "Donation VM check"
+          echo "============================================================"
+
+          grep -n \
+            'donationPage.*VmProvider' \
+            app/lib/pages/donation/donation_page.dart \
+            || true
+
+
+      # ============================================================
+      # Flutter / Dart dependencies
+      #
+      # IMPORTANT: pub get comes AFTER the IAP removal, so Flutter
+      # never generates a macOS plugin entry for
+      # in_app_purchase_storekit.
       # ============================================================
 
       - name: Clean Flutter build
@@ -98,6 +285,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           flutter clean
 
       - name: Flutter pub get
@@ -105,13 +293,74 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           flutter pub get
+
+
+      # ============================================================
+      # Hard-check that StoreKit plugin is really gone
+      # ============================================================
+
+      - name: Verify in-app purchase plugin is gone
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "============================================================"
+          echo "Flutter dependency tree"
+          echo "============================================================"
+
+          cd app
+
+          flutter pub deps \
+            --style=compact \
+            > ../flutter-pub-deps.txt
+
+          if grep -E \
+            '(^| )in_app_purchase(_storekit)?([ :]|$)' \
+            ../flutter-pub-deps.txt; then
+
+            echo
+            echo "ERROR:"
+            echo "in_app_purchase is still in the Flutter dependency graph."
+            exit 1
+          fi
+
+          cd ..
+
+          echo "No in_app_purchase dependency remains."
+
+
+          if [ -f app/.flutter-plugins-dependencies ]; then
+
+            echo
+            echo "============================================================"
+            echo ".flutter-plugins-dependencies StoreKit check"
+            echo "============================================================"
+
+            if grep -q \
+              'in_app_purchase_storekit' \
+              app/.flutter-plugins-dependencies; then
+
+              echo "ERROR:"
+              echo "Flutter still generated in_app_purchase_storekit."
+              exit 1
+            fi
+          fi
+
+          echo "StoreKit Flutter plugin successfully removed."
+
+
+      # ============================================================
+      # Cargokit / Rust
+      # ============================================================
 
       - name: Prepare Cargokit
         working-directory: packages/localsend_isolates/rust_builder/cargokit/build_tool
         shell: bash
         run: |
           set -euxo pipefail
+
           flutter pub get
 
       - name: Verify Rust workspace
@@ -141,6 +390,7 @@ jobs:
                   f"  {package['name']} "
                   f"{package['version']}"
               )
+
               print(
                   f"    {package['manifest_path']}"
               )
@@ -148,13 +398,13 @@ jobs:
 
 
       # ============================================================
-      # gal 2.3.3 High Sierra compatibility shim
+      # gal 2.3.3 High Sierra shim
       #
-      # gal 2.3.3's macOS implementation imports Photos and is
-      # declared as macOS 11.0+.
+      # gal's macOS implementation imports PhotoKit and its podspec
+      # declares macOS 11.
       #
-      # LocalSend does not normally use gallery saving on macOS, so
-      # preserve plugin registration but remove PhotoKit dependence.
+      # LocalSend doesn't normally use gallery saving on macOS.
+      # Keep Flutter plugin registration but remove PhotoKit.
       # ============================================================
 
       - name: Backport gal for High Sierra
@@ -180,16 +430,29 @@ jobs:
               -quit
           )"
 
+
           if [ -z "$GAL_SWIFT" ]; then
-            echo "ERROR: GalPlugin.swift was not found."
-            find "$PUB_CACHE_ROOT" -iname '*gal*' -print || true
+
+            echo "ERROR:"
+            echo "gal 2.3.3 GalPlugin.swift was not found."
+
+            find "$PUB_CACHE_ROOT" \
+              -iname '*gal*' \
+              -print \
+              || true
+
             exit 1
           fi
 
+
           if [ -z "$GAL_PODSPEC" ]; then
-            echo "ERROR: gal.podspec was not found."
+
+            echo "ERROR:"
+            echo "gal 2.3.3 gal.podspec was not found."
+
             exit 1
           fi
+
 
           echo "GalPlugin.swift:"
           echo "$GAL_SWIFT"
@@ -198,31 +461,63 @@ jobs:
           echo "gal.podspec:"
           echo "$GAL_PODSPEC"
 
-          cp "$GAL_SWIFT" "${GAL_SWIFT}.original"
-          cp "$GAL_PODSPEC" "${GAL_PODSPEC}.original"
+
+          cp \
+            "$GAL_SWIFT" \
+            "${GAL_SWIFT}.original"
+
+          cp \
+            "$GAL_PODSPEC" \
+            "${GAL_PODSPEC}.original"
+
+
+          # --------------------------------------------------------
+          # Lower gal's declared macOS deployment target.
+          # --------------------------------------------------------
 
           python3 - "$GAL_PODSPEC" <<'PY'
           import re
           import sys
+
           from pathlib import Path
 
+
           path = Path(sys.argv[1])
+
           text = path.read_text()
 
+
           text, count = re.subn(
-              r"s\.osx\.deployment_target\s*=\s*['\"][0-9.]+['\"]",
+              r"s\.osx\.deployment_target"
+              r"\s*=\s*"
+              r"['\"][0-9.]+['\"]",
               "s.osx.deployment_target = '10.13'",
               text,
               count=1,
           )
 
+
           if count != 1:
               raise SystemExit(
-                  "ERROR: Could not patch gal macOS deployment target."
+                  "ERROR: Could not patch "
+                  "gal macOS deployment target."
               )
+
 
           path.write_text(text)
           PY
+
+
+          # --------------------------------------------------------
+          # High Sierra native shim.
+          #
+          # Preserve:
+          #
+          #   class GalPlugin
+          #   MethodChannel "gal"
+          #
+          # so GeneratedPluginRegistrant remains valid.
+          # --------------------------------------------------------
 
           cat > "$GAL_SWIFT" <<'SWIFT'
           import Cocoa
@@ -273,6 +568,7 @@ jobs:
                 )
 
               case "open":
+
                 if let url = URL(string: "photos://") {
                   _ = NSWorkspace.shared.open(url)
                 }
@@ -286,6 +582,7 @@ jobs:
           }
           SWIFT
 
+
           echo
           echo "============================================================"
           echo "gal after patch"
@@ -293,24 +590,29 @@ jobs:
 
           cat "$GAL_SWIFT"
 
+          echo
           grep -n \
             'deployment_target' \
             "$GAL_PODSPEC" \
             || true
 
+
           if grep -E \
             'import Photos|PHPhotoLibrary|PHAsset|PHFetch' \
             "$GAL_SWIFT"; then
 
-            echo "ERROR: PhotoKit API remains in gal shim."
+            echo "ERROR:"
+            echo "PhotoKit APIs remain in gal shim."
+
             exit 1
           fi
 
+          echo
           echo "gal High Sierra shim installed."
 
 
       # ============================================================
-      # LocalSend / Xcode backport
+      # LocalSend / Xcode High Sierra backport
       # ============================================================
 
       - name: Patch LocalSend for High Sierra
@@ -328,9 +630,15 @@ jobs:
           echo "Target: macOS 10.13 / x86_64"
           echo "============================================================"
 
+
+          # ========================================================
+          # Xcode project
+          # ========================================================
+
           python3 <<'PY'
           from pathlib import Path
           import re
+
 
           pbx = Path(
               "app/macos/Runner.xcodeproj/project.pbxproj"
@@ -339,123 +647,143 @@ jobs:
           text = pbx.read_text()
 
 
-          # ========================================================
+          # --------------------------------------------------------
           # Deployment targets
           #
-          # Flutter 3.41.9 migrates a literal:
+          # Flutter 3.41.9 automatically migrates a literal:
           #
           #   MACOSX_DEPLOYMENT_TARGET = 10.13;
           #
-          # back to 10.15.
+          # to 10.15.
           #
-          # Use an indirect build setting to avoid that migration.
-          # ========================================================
+          # Use an indirect setting instead.
+          # --------------------------------------------------------
 
           text, deployment_count = re.subn(
-              r'MACOSX_DEPLOYMENT_TARGET\s*=\s*[0-9.]+;',
+              r'MACOSX_DEPLOYMENT_TARGET'
+              r'\s*=\s*'
+              r'[0-9.]+;',
               'MACOSX_DEPLOYMENT_TARGET = '
               '"$(LOCALSEND_LEGACY_MACOS_TARGET)";',
               text,
           )
 
+
           if deployment_count == 0:
               raise SystemExit(
-                  "ERROR: No Xcode deployment targets were found."
+                  "ERROR: No Xcode deployment targets found."
               )
 
+
           print(
-              "Patched "
-              f"{deployment_count} Xcode deployment target(s)."
+              f"Patched {deployment_count} "
+              "Xcode deployment target(s)."
           )
 
 
-          # ========================================================
-          # Force every project build configuration to x86_64.
+          # --------------------------------------------------------
+          # x86_64-only settings
           #
-          # This includes:
-          #
-          #   project Release
-          #   Runner
-          #   ShareExtension
-          #   Flutter Assemble
-          #
-          # and helps SPM inherit the correct architecture.
-          # ========================================================
-
-          arch_settings = (
-              "buildSettings = {\n"
-              "\t\t\t\t"
-              "LOCALSEND_LEGACY_MACOS_TARGET = 10.13;\n"
-              "\t\t\t\t"
-              "ARCHS = x86_64;\n"
-              "\t\t\t\t"
-              "EXCLUDED_ARCHS = arm64;\n"
-              "\t\t\t\t"
-              "ONLY_ACTIVE_ARCH = YES;\n"
-          )
+          # Add to every XCBuildConfiguration.
+          # --------------------------------------------------------
 
           if (
               "LOCALSEND_LEGACY_MACOS_TARGET = 10.13;"
               not in text
           ):
+
+              replacement = (
+                  "buildSettings = {\n"
+                  "\t\t\t\t"
+                  "LOCALSEND_LEGACY_MACOS_TARGET = 10.13;\n"
+                  "\t\t\t\t"
+                  "ARCHS = x86_64;\n"
+                  "\t\t\t\t"
+                  "EXCLUDED_ARCHS = arm64;\n"
+                  "\t\t\t\t"
+                  "ONLY_ACTIVE_ARCH = YES;\n"
+              )
+
               text = text.replace(
                   "buildSettings = {\n",
-                  arch_settings,
+                  replacement,
               )
 
 
-          # ========================================================
-          # Remove upstream LocalSend development signing.
-          # ========================================================
+          # --------------------------------------------------------
+          # Remove upstream developer signing.
+          # --------------------------------------------------------
 
           text = re.sub(
-              r'DEVELOPMENT_TEAM\s*=\s*[A-Z0-9]+;',
+              r'DEVELOPMENT_TEAM'
+              r'\s*=\s*'
+              r'[A-Z0-9]+;',
               'DEVELOPMENT_TEAM = "";',
               text,
           )
 
+
           text = re.sub(
-              r'CODE_SIGN_STYLE\s*=\s*Automatic;',
+              r'CODE_SIGN_STYLE'
+              r'\s*=\s*'
+              r'Automatic;',
               'CODE_SIGN_STYLE = Manual;',
               text,
           )
 
+
           text = re.sub(
-              r'CODE_SIGN_IDENTITY\s*=\s*'
-              r'"(?:Apple Development|Mac Development|Mac Developer)";',
+              r'CODE_SIGN_IDENTITY'
+              r'\s*=\s*'
+              r'"(?:'
+              r'Apple Development|'
+              r'Mac Development|'
+              r'Mac Developer'
+              r')";',
               'CODE_SIGN_IDENTITY = "-";',
               text,
           )
 
+
           text = re.sub(
-              r'("CODE_SIGN_IDENTITY\[sdk=macosx\*\]"\s*=\s*)'
-              r'"(?:Apple Development|Mac Development|Mac Developer)";',
+              r'('
+              r'"CODE_SIGN_IDENTITY\[sdk=macosx\*\]"'
+              r'\s*=\s*'
+              r')'
+              r'"(?:'
+              r'Apple Development|'
+              r'Mac Development|'
+              r'Mac Developer'
+              r')";',
               r'\1"-";',
               text,
           )
 
+
           text = re.sub(
-              r'PROVISIONING_PROFILE_SPECIFIER\s*=\s*"[^"]*";',
+              r'PROVISIONING_PROFILE_SPECIFIER'
+              r'\s*=\s*'
+              r'"[^"]*";',
               'PROVISIONING_PROFILE_SPECIFIER = "";',
               text,
           )
 
+
           text = re.sub(
-              r'PROVISIONING_PROFILE\s*=\s*"[^"]*";',
+              r'PROVISIONING_PROFILE'
+              r'\s*=\s*'
+              r'"[^"]*";',
               'PROVISIONING_PROFILE = "";',
               text,
           )
 
 
-          # ========================================================
-          # DockProgress backport
+          # --------------------------------------------------------
+          # DockProgress
           #
-          # IMPORTANT:
-          # This deliberately does NOT depend on tabs/spaces.
-          #
-          # Find the Swift package by its repository URL and replace
-          # only its requirement block.
-          # ========================================================
+          # Find it structurally by repository URL.
+          # Do not depend on Xcode's tabs/spaces.
+          # --------------------------------------------------------
 
           dock_pattern = re.compile(
               r'('
@@ -463,12 +791,16 @@ jobs:
               r'\s*/\*\s*'
               r'XCRemoteSwiftPackageReference '
               r'"DockProgress"'
-              r'\s*\*/\s*=\s*\{'
+              r'\s*\*/'
+              r'\s*=\s*\{'
               r'.*?'
-              r'repositoryURL\s*=\s*'
-              r'"https://github\.com/sindresorhus/DockProgress";'
+              r'repositoryURL'
+              r'\s*=\s*'
+              r'"https://github\.com/'
+              r'sindresorhus/DockProgress";'
               r'\s*'
-              r'requirement\s*=\s*\{'
+              r'requirement'
+              r'\s*=\s*\{'
               r')'
               r'.*?'
               r'('
@@ -479,13 +811,16 @@ jobs:
               re.DOTALL,
           )
 
+
           match = dock_pattern.search(text)
+
 
           if not match:
               raise SystemExit(
-                  "ERROR: Could not locate the DockProgress "
-                  "Swift package block."
+                  "ERROR: Could not locate "
+                  "DockProgress Swift package block."
               )
+
 
           replacement = (
               match.group(1)
@@ -496,6 +831,7 @@ jobs:
               + match.group(2)
           )
 
+
           text = (
               text[:match.start()]
               + replacement
@@ -503,13 +839,11 @@ jobs:
           )
 
 
-          # ========================================================
-          # Validate the result structurally.
-          # ========================================================
-
           dock_check = re.compile(
-              r'repositoryURL\s*=\s*'
-              r'"https://github\.com/sindresorhus/DockProgress";'
+              r'repositoryURL'
+              r'\s*=\s*'
+              r'"https://github\.com/'
+              r'sindresorhus/DockProgress";'
               r'.*?'
               r'kind\s*=\s*exactVersion;'
               r'.*?'
@@ -517,20 +851,25 @@ jobs:
               re.DOTALL,
           )
 
+
           if not dock_check.search(text):
               raise SystemExit(
-                  "ERROR: DockProgress was found, but the "
-                  "3.2.0 exact-version patch did not validate."
+                  "ERROR: DockProgress 3.2.0 "
+                  "patch validation failed."
               )
 
-          print("DockProgress patched to exact version 3.2.0.")
+
+          print(
+              "DockProgress patched to exact version 3.2.0."
+          )
+
 
           pbx.write_text(text)
           PY
 
 
           # ========================================================
-          # Release xcconfig
+          # Actual Release xcconfig
           # ========================================================
 
           cat >> "$RELEASE_XCCONFIG" <<'EOF'
@@ -561,22 +900,35 @@ jobs:
           from pathlib import Path
           import re
 
-          podfile = Path("app/macos/Podfile")
+
+          podfile = Path(
+              "app/macos/Podfile"
+          )
+
           text = podfile.read_text()
 
 
           # --------------------------------------------------------
-          # Avoid Flutter's literal 10.13 migration.
+          # Global platform.
+          #
+          # Do not use literal:
+          #
+          #   platform :osx, '10.13'
+          #
+          # because Flutter's migration detects it.
           # --------------------------------------------------------
 
           text, platform_count = re.subn(
-              r"^platform\s+:osx,\s*['\"][0-9.]+['\"]",
+              r"^platform"
+              r"\s+:osx,"
+              r"\s*['\"][0-9.]+['\"]",
               "legacy_macos_target = '10.13'\n"
               "platform :osx, legacy_macos_target",
               text,
               count=1,
               flags=re.MULTILINE,
           )
+
 
           if platform_count != 1:
               raise SystemExit(
@@ -585,27 +937,32 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Patch post_install deployment target.
+          # Every generated Pod deployment target.
           # --------------------------------------------------------
 
           text, pod_target_count = re.subn(
               r"config\.build_settings"
-              r"\[['\"]MACOSX_DEPLOYMENT_TARGET['\"]\]"
-              r"\s*=\s*['\"][0-9.]+['\"]",
+              r"\[['\"]"
+              r"MACOSX_DEPLOYMENT_TARGET"
+              r"['\"]\]"
+              r"\s*=\s*"
+              r"['\"][0-9.]+['\"]",
               "config.build_settings"
               "['MACOSX_DEPLOYMENT_TARGET'] "
               "= legacy_macos_target",
               text,
           )
 
+
           if pod_target_count == 0:
               raise SystemExit(
-                  "ERROR: Could not patch Pod deployment target."
+                  "ERROR: Could not patch "
+                  "Pod deployment targets."
               )
 
 
           # --------------------------------------------------------
-          # Force Pods to x86_64.
+          # Force every Pod to x86_64.
           # --------------------------------------------------------
 
           needle = (
@@ -614,15 +971,19 @@ jobs:
               "= legacy_macos_target"
           )
 
+
           if (
-              "config.build_settings['ARCHS'] = 'x86_64'"
+              "config.build_settings"
+              "['ARCHS'] = 'x86_64'"
               not in text
           ):
+
               replacement = (
                   needle
                   + "\n"
                   + "      "
-                  + "config.build_settings['ARCHS'] = 'x86_64'"
+                  + "config.build_settings"
+                  + "['ARCHS'] = 'x86_64'"
                   + "\n"
                   + "      "
                   + "config.build_settings"
@@ -633,6 +994,7 @@ jobs:
                   + "['ONLY_ACTIVE_ARCH'] = 'YES'"
               )
 
+
               text = text.replace(
                   needle,
                   replacement,
@@ -642,7 +1004,7 @@ jobs:
 
           # --------------------------------------------------------
           # ShareExtension compiles Shared.swift, which imports
-          # Defaults. Give the extension its own Defaults pod target.
+          # Defaults. Give the extension its own Defaults target.
           # --------------------------------------------------------
 
           if "target 'ShareExtension' do" not in text:
@@ -657,6 +1019,7 @@ jobs:
 
           """
 
+
               text = text.replace(
                   "\npost_install do |installer|",
                   "\n"
@@ -665,22 +1028,25 @@ jobs:
                   1,
               )
 
+
           if "target 'ShareExtension' do" not in text:
               raise SystemExit(
                   "ERROR: Failed to create "
                   "ShareExtension CocoaPods target."
               )
 
+
           podfile.write_text(text)
           PY
 
 
           # ========================================================
-          # Remove unnecessary @MainActor from native channel glue.
+          # Remove unnecessary @MainActor.
           # ========================================================
 
           python3 <<'PY'
           from pathlib import Path
+
 
           path = Path(
               "app/macos/Runner/AppDelegate.swift"
@@ -688,29 +1054,25 @@ jobs:
 
           text = path.read_text()
 
+
           text = text.replace(
               "@MainActor private func handleFlutterCall",
               "private func handleFlutterCall",
           )
+
 
           path.write_text(text)
           PY
 
 
           # ========================================================
-          # Remove stale committed SwiftPM resolution files.
-          #
-          # Do not assume Xcode will recreate either one.
+          # Remove stale SwiftPM locks.
           # ========================================================
 
           rm -f \
             app/macos/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
             app/macos/Runner.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
-
-          # ========================================================
-          # Diagnostics
-          # ========================================================
 
           echo
           echo "============================================================"
@@ -722,25 +1084,6 @@ jobs:
             "$PBX" \
             || true
 
-          echo
-          echo "============================================================"
-          echo "Deployment settings"
-          echo "============================================================"
-
-          grep -nE \
-            'MACOSX_DEPLOYMENT_TARGET|LOCALSEND_LEGACY_MACOS_TARGET|ARCHS|EXCLUDED_ARCHS' \
-            "$PBX" \
-            || true
-
-          echo
-          echo "============================================================"
-          echo "Signing settings"
-          echo "============================================================"
-
-          grep -nE \
-            'DEVELOPMENT_TEAM|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY' \
-            "$PBX" \
-            || true
 
           echo
           echo "============================================================"
@@ -762,38 +1105,55 @@ jobs:
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
           PODFILE="app/macos/Podfile"
 
-          if grep -q "3W7H4PYMCV" "$PBX"; then
-            echo "ERROR: Upstream Apple Team ID remains."
+
+          if grep -q \
+            "3W7H4PYMCV" \
+            "$PBX"; then
+
+            echo "ERROR:"
+            echo "Upstream Apple Team ID remains."
+
             exit 1
           fi
+
 
           if grep -q \
             'MACOSX_DEPLOYMENT_TARGET = 10.13;' \
             "$PBX"; then
 
-            echo "ERROR: Literal 10.13 remains in pbxproj."
+            echo "ERROR:"
+            echo "Literal 10.13 remains in pbxproj."
+
             exit 1
           fi
+
 
           if grep -q \
             "platform :osx, '10.13'" \
             "$PODFILE"; then
 
-            echo "ERROR: Literal 10.13 remains in Podfile."
+            echo "ERROR:"
+            echo "Literal 10.13 remains in Podfile."
+
             exit 1
           fi
+
 
           python3 <<'PY'
           from pathlib import Path
           import re
 
+
           text = Path(
               "app/macos/Runner.xcodeproj/project.pbxproj"
           ).read_text()
 
+
           pattern = re.compile(
-              r'repositoryURL\s*=\s*'
-              r'"https://github\.com/sindresorhus/DockProgress";'
+              r'repositoryURL'
+              r'\s*=\s*'
+              r'"https://github\.com/'
+              r'sindresorhus/DockProgress";'
               r'.*?'
               r'kind\s*=\s*exactVersion;'
               r'.*?'
@@ -801,27 +1161,48 @@ jobs:
               re.DOTALL,
           )
 
+
           if not pattern.search(text):
               raise SystemExit(
-                  "ERROR: DockProgress 3.2.0 validation failed."
+                  "ERROR: DockProgress 3.2.0 "
+                  "validation failed."
               )
 
-          print("DockProgress 3.2.0 validation passed.")
+
+          print(
+              "DockProgress 3.2.0 validation passed."
+          )
           PY
+
 
           if ! grep -q \
             "target 'ShareExtension' do" \
             "$PODFILE"; then
 
-            echo "ERROR: ShareExtension pod target missing."
+            echo "ERROR:"
+            echo "ShareExtension Pod target missing."
+
             exit 1
           fi
 
-          echo "Static patch validation passed."
+
+          if grep -q \
+            '^ *in_app_purchase:' \
+            app/pubspec.yaml; then
+
+            echo "ERROR:"
+            echo "in_app_purchase returned to pubspec.yaml."
+
+            exit 1
+          fi
+
+
+          echo
+          echo "Static High Sierra patch validation passed."
 
 
       # ============================================================
-      # Generate Flutter configuration and CocoaPods integration
+      # Generate Flutter configuration / CocoaPods
       # ============================================================
 
       - name: Generate Flutter macOS configuration
@@ -838,7 +1219,74 @@ jobs:
 
 
       # ============================================================
-      # Verify Flutter migration did not undo 10.13
+      # Validate generated native dependency graph
+      # ============================================================
+
+      - name: Verify StoreKit plugin stayed removed
+        working-directory: app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "============================================================"
+          echo "Podfile.lock"
+          echo "============================================================"
+
+          if [ -f macos/Podfile.lock ]; then
+
+            if grep -q \
+              'in_app_purchase_storekit' \
+              macos/Podfile.lock; then
+
+              echo "ERROR:"
+              echo "in_app_purchase_storekit returned to Podfile.lock."
+
+              grep -n \
+                'in_app_purchase_storekit' \
+                macos/Podfile.lock \
+                || true
+
+              exit 1
+            fi
+          fi
+
+
+          echo
+          echo "============================================================"
+          echo "GeneratedPluginRegistrant"
+          echo "============================================================"
+
+          REGISTRANT="$(
+            find macos \
+              -type f \
+              -name 'GeneratedPluginRegistrant.swift' \
+              -print \
+              -quit
+          )"
+
+
+          if [ -n "$REGISTRANT" ]; then
+
+            cat "$REGISTRANT"
+
+            if grep -q \
+              'in_app_purchase' \
+              "$REGISTRANT"; then
+
+              echo "ERROR:"
+              echo "StoreKit plugin still exists in GeneratedPluginRegistrant."
+
+              exit 1
+            fi
+          fi
+
+
+          echo
+          echo "in_app_purchase_storekit is absent."
+
+
+      # ============================================================
+      # Ensure Flutter didn't silently restore Catalina
       # ============================================================
 
       - name: Verify Flutter migration bypass
@@ -849,30 +1297,38 @@ jobs:
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
           PODFILE="app/macos/Podfile"
 
+
           if grep -q \
             'MACOSX_DEPLOYMENT_TARGET = 10.15;' \
             "$PBX"; then
 
-            echo "ERROR: Flutter restored macOS 10.15."
+            echo "ERROR:"
+            echo "Flutter restored macOS 10.15."
+
             grep -n \
               'MACOSX_DEPLOYMENT_TARGET = 10.15;' \
               "$PBX"
+
             exit 1
           fi
+
 
           if grep -q \
             "platform :osx, '10.15'" \
             "$PODFILE"; then
 
-            echo "ERROR: Flutter restored Podfile to 10.15."
+            echo "ERROR:"
+            echo "Flutter restored Podfile to 10.15."
+
             exit 1
           fi
+
 
           echo "Flutter migration bypass survived."
 
 
       # ============================================================
-      # Verify gal shim survived pub/config generation
+      # Verify gal shim survived config generation
       # ============================================================
 
       - name: Verify gal High Sierra shim
@@ -898,27 +1354,38 @@ jobs:
               -quit
           )"
 
+
           test -n "$GAL_SWIFT"
           test -n "$GAL_PODSPEC"
 
-          if grep -q 'import Photos' "$GAL_SWIFT"; then
-            echo "ERROR: Original gal PhotoKit source returned."
+
+          if grep -q \
+            'import Photos' \
+            "$GAL_SWIFT"; then
+
+            echo "ERROR:"
+            echo "Original gal PhotoKit implementation returned."
+
             exit 1
           fi
+
 
           if ! grep -q \
             "s.osx.deployment_target = '10.13'" \
             "$GAL_PODSPEC"; then
 
-            echo "ERROR: gal podspec target is not 10.13."
+            echo "ERROR:"
+            echo "gal podspec target is not 10.13."
+
             exit 1
           fi
+
 
           echo "gal High Sierra shim survived."
 
 
       # ============================================================
-      # Verify CocoaPods
+      # Verify CocoaPods integration
       # ============================================================
 
       - name: Verify CocoaPods integration
@@ -931,28 +1398,48 @@ jobs:
           echo "Generated CocoaPods targets"
           echo "============================================================"
 
-          find "Pods/Target Support Files" \
+          find \
+            "Pods/Target Support Files" \
             -maxdepth 1 \
             -type d \
             -print \
             | sort
 
+
           if [ ! -d \
             "Pods/Target Support Files/Pods-ShareExtension" ]; then
 
-            echo "ERROR: Pods-ShareExtension was not generated."
+            echo "ERROR:"
+            echo "Pods-ShareExtension was not generated."
+
             exit 1
           fi
 
+
+          if find \
+            "Pods/Target Support Files" \
+            -iname '*in_app_purchase*' \
+            -print \
+            | grep -q .; then
+
+            echo "ERROR:"
+            echo "StoreKit Pod support files still exist."
+
+            find \
+              "Pods/Target Support Files" \
+              -iname '*in_app_purchase*' \
+              -print
+
+            exit 1
+          fi
+
+
           echo
-          echo "ShareExtension CocoaPods integration exists."
+          echo "CocoaPods integration looks correct."
 
 
       # ============================================================
       # Resolve Swift packages
-      #
-      # Do NOT require Package.resolved to exist at a specific path.
-      # The Xcode resolution command itself is authoritative here.
       # ============================================================
 
       - name: Resolve Swift packages
@@ -961,7 +1448,9 @@ jobs:
         run: |
           set -o pipefail
 
-          mkdir -p build/macos/SourcePackages
+          mkdir -p \
+            build/macos/SourcePackages
+
 
           xcodebuild \
             -resolvePackageDependencies \
@@ -971,12 +1460,15 @@ jobs:
               build/macos/SourcePackages \
             2>&1 | tee ../swiftpm-resolve.log
 
+
           echo
           echo "============================================================"
           echo "SwiftPM checkout diagnostics"
           echo "============================================================"
 
-          find build/macos/SourcePackages \
+
+          find \
+            build/macos/SourcePackages \
             -maxdepth 3 \
             -type d \
             -print \
@@ -984,26 +1476,36 @@ jobs:
             | head -200 \
             || true
 
-          if [ -d \
-            "build/macos/SourcePackages/checkouts/DockProgress/.git" ]; then
+
+          DOCK_DIR="$(
+            find \
+              build/macos/SourcePackages/checkouts \
+              -maxdepth 1 \
+              -type d \
+              -iname 'DockProgress' \
+              -print \
+              -quit
+          )"
+
+
+          if [ -n "$DOCK_DIR" ]; then
 
             echo
-            echo "DockProgress HEAD:"
-            git \
-              -C build/macos/SourcePackages/checkouts/DockProgress \
-              rev-parse HEAD \
-              || true
+            echo "DockProgress checkout:"
+            echo "$DOCK_DIR"
 
             echo
-            echo "DockProgress tags at HEAD:"
+            echo "Tags at HEAD:"
+
             git \
-              -C build/macos/SourcePackages/checkouts/DockProgress \
+              -C "$DOCK_DIR" \
               tag --points-at HEAD \
               || true
           fi
 
+
           echo
-          echo "Package.resolved files, if Xcode created any:"
+          echo "Package.resolved files, if any:"
 
           find macos \
             -type f \
@@ -1014,7 +1516,7 @@ jobs:
 
 
       # ============================================================
-      # Verify the settings Xcode actually sees
+      # Verify effective Xcode settings
       # ============================================================
 
       - name: Verify effective Xcode build settings
@@ -1025,6 +1527,7 @@ jobs:
 
           mkdir -p ../diagnostics
 
+
           xcodebuild \
             -workspace macos/Runner.xcworkspace \
             -scheme Runner \
@@ -1032,12 +1535,14 @@ jobs:
             -showBuildSettings \
             > ../diagnostics/runner-build-settings.txt
 
+
           xcodebuild \
             -project macos/Runner.xcodeproj \
             -target ShareExtension \
             -configuration Release \
             -showBuildSettings \
             > ../diagnostics/shareextension-build-settings.txt
+
 
           echo "============================================================"
           echo "Runner"
@@ -1047,6 +1552,7 @@ jobs:
             'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|LOCALSEND_LEGACY_MACOS_TARGET' \
             ../diagnostics/runner-build-settings.txt \
             || true
+
 
           echo
           echo "============================================================"
@@ -1058,43 +1564,59 @@ jobs:
             ../diagnostics/shareextension-build-settings.txt \
             || true
 
+
           python3 <<'PY'
           from pathlib import Path
           import re
+
 
           files = [
               Path(
                   "../diagnostics/"
                   "runner-build-settings.txt"
               ),
+
               Path(
                   "../diagnostics/"
                   "shareextension-build-settings.txt"
               ),
           ]
 
+
           for path in files:
+
               text = path.read_text()
 
+
               deployment = re.findall(
-                  r"^\s*MACOSX_DEPLOYMENT_TARGET"
-                  r"\s*=\s*(.*?)\s*$",
+                  r"^\s*"
+                  r"MACOSX_DEPLOYMENT_TARGET"
+                  r"\s*=\s*"
+                  r"(.*?)\s*$",
                   text,
                   flags=re.MULTILINE,
               )
+
 
               archs = re.findall(
-                  r"^\s*ARCHS\s*=\s*(.*?)\s*$",
+                  r"^\s*"
+                  r"ARCHS"
+                  r"\s*=\s*"
+                  r"(.*?)\s*$",
                   text,
                   flags=re.MULTILINE,
               )
 
+
               excluded = re.findall(
-                  r"^\s*EXCLUDED_ARCHS"
-                  r"\s*=\s*(.*?)\s*$",
+                  r"^\s*"
+                  r"EXCLUDED_ARCHS"
+                  r"\s*=\s*"
+                  r"(.*?)\s*$",
                   text,
                   flags=re.MULTILINE,
               )
+
 
               print()
               print(path)
@@ -1102,46 +1624,57 @@ jobs:
               print("  ARCHS:", archs[:3])
               print("  EXCLUDED_ARCHS:", excluded[:3])
 
+
               if not deployment:
                   raise SystemExit(
                       f"ERROR: {path}: "
                       "MACOSX_DEPLOYMENT_TARGET missing."
                   )
 
+
               if deployment[0] != "10.13":
                   raise SystemExit(
                       f"ERROR: {path}: "
-                      f"target is {deployment[0]!r}, "
+                      f"target is {deployment[0]!r}; "
                       "expected '10.13'."
                   )
+
 
               if not archs:
                   raise SystemExit(
                       f"ERROR: {path}: ARCHS missing."
                   )
 
+
               if "x86_64" not in archs[0].split():
                   raise SystemExit(
-                      f"ERROR: {path}: x86_64 missing."
+                      f"ERROR: {path}: "
+                      "x86_64 missing from ARCHS."
                   )
 
+
               if excluded:
+
                   if "arm64" not in excluded[0].split():
+
                       raise SystemExit(
                           f"ERROR: {path}: "
                           "arm64 is not excluded."
                       )
 
+
           print()
-          print("Effective Xcode settings are correct.")
+          print(
+              "Effective Xcode settings are correct."
+          )
           PY
 
 
       # ============================================================
       # Actual build
       #
-      # rust_lib_localsend_app is built by Cargokit.
-      # Do not run a separate cargo build here.
+      # rust_lib_localsend_app is built by Cargokit as part of
+      # Flutter/Xcode. Do not run cargo build separately.
       # ============================================================
 
       - name: Build macOS app
@@ -1155,13 +1688,16 @@ jobs:
 
           echo "============================================================"
           echo "Building LocalSend"
-          echo "Target:       macOS High Sierra 10.13"
-          echo "Architecture: x86_64"
-          echo "Flutter:      ${FLUTTER_VERSION}"
-          echo "Rust:         ${RUST_VERSION}"
-          echo "DockProgress: 3.2.0"
-          echo "gal:          High Sierra shim"
+          echo
+          echo "Target OS:       macOS High Sierra 10.13"
+          echo "Architecture:    x86_64"
+          echo "Flutter:         ${FLUTTER_VERSION}"
+          echo "Rust:            ${RUST_VERSION}"
+          echo "DockProgress:    3.2.0"
+          echo "gal:             High Sierra shim"
+          echo "StoreKit/IAP:    removed"
           echo "============================================================"
+
 
           flutter build macos \
             --release \
@@ -1170,7 +1706,9 @@ jobs:
 
 
       # ============================================================
-      # Extract useful compiler failures
+      # Extract useful compiler errors
+      #
+      # Print context rather than only grep-matched lines.
       # ============================================================
 
       - name: Extract compiler errors
@@ -1181,21 +1719,110 @@ jobs:
 
           mkdir -p diagnostics
 
+
           if [ -f flutter-macos-build.log ]; then
 
-            grep -nE \
-              'error:|fatal error:|is only available in macOS|introduced in macOS|requires macOS|BUILD FAILED|The following build commands failed' \
-              flutter-macos-build.log \
-              > diagnostics/compiler-errors.txt \
-              || true
+            python3 <<'PY'
+          from pathlib import Path
+          import re
 
-            echo "============================================================"
-            echo "Compiler errors"
-            echo "============================================================"
 
-            tail -n 400 \
-              diagnostics/compiler-errors.txt \
-              || true
+          source = Path(
+              "flutter-macos-build.log"
+          )
+
+          output = Path(
+              "diagnostics/compiler-errors.txt"
+          )
+
+
+          lines = source.read_text(
+              errors="replace"
+          ).splitlines()
+
+
+          pattern = re.compile(
+              r"error:|"
+              r"fatal error:|"
+              r"is only available in macOS|"
+              r"introduced in macOS|"
+              r"requires macOS|"
+              r"\*\* BUILD FAILED \*\*|"
+              r"The following build commands failed"
+          )
+
+
+          hit_indexes = [
+              index
+              for index, line in enumerate(lines)
+              if pattern.search(line)
+          ]
+
+
+          ranges = []
+
+          for index in hit_indexes:
+
+              start = max(
+                  0,
+                  index - 5,
+              )
+
+              end = min(
+                  len(lines),
+                  index + 8,
+              )
+
+
+              if (
+                  ranges
+                  and start <= ranges[-1][1]
+              ):
+
+                  ranges[-1] = (
+                      ranges[-1][0],
+                      max(
+                          ranges[-1][1],
+                          end,
+                      ),
+                  )
+
+              else:
+
+                  ranges.append(
+                      (start, end)
+                  )
+
+
+          chunks = []
+
+          for start, end in ranges:
+
+              chunks.append(
+                  "=" * 80
+              )
+
+              for index in range(start, end):
+
+                  chunks.append(
+                      f"{index + 1}: "
+                      f"{lines[index]}"
+                  )
+
+
+          output.write_text(
+              "\n".join(chunks)
+              + ("\n" if chunks else "")
+          )
+
+
+          print(
+              output.read_text()
+              if output.exists()
+              else "No compiler diagnostics extracted."
+          )
+          PY
+
           fi
 
 
@@ -1210,7 +1837,8 @@ jobs:
           set -euxo pipefail
 
           APP="$(
-            find build/macos/Build/Products/Release \
+            find \
+              build/macos/Build/Products/Release \
               -maxdepth 1 \
               -type d \
               -name '*.app' \
@@ -1218,10 +1846,15 @@ jobs:
               -quit
           )"
 
+
           if [ -z "$APP" ]; then
-            echo "ERROR: No .app bundle was produced."
+
+            echo "ERROR:"
+            echo "No .app bundle was produced."
+
             exit 1
           fi
+
 
           EXECUTABLE="$(
             /usr/libexec/PlistBuddy \
@@ -1229,9 +1862,17 @@ jobs:
               "$APP/Contents/Info.plist"
           )"
 
-          echo "APP=$APP" >> "$GITHUB_ENV"
-          echo "APP_EXECUTABLE=$EXECUTABLE" >> "$GITHUB_ENV"
 
+          echo \
+            "APP=$APP" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "APP_EXECUTABLE=$EXECUTABLE" \
+            >> "$GITHUB_ENV"
+
+
+          echo
           echo "Application:"
           echo "$APP"
 
@@ -1252,27 +1893,52 @@ jobs:
 
           MAIN="$APP/Contents/MacOS/$APP_EXECUTABLE"
 
-          file "$MAIN"
-          lipo -info "$MAIN"
 
-          ARCHES="$(lipo -archs "$MAIN")"
+          file "$MAIN"
+
+          lipo \
+            -info \
+            "$MAIN"
+
+
+          ARCHES="$(
+            lipo \
+              -archs \
+              "$MAIN"
+          )"
+
 
           echo
-          echo "Architectures: $ARCHES"
+          echo "Architectures:"
+          echo "$ARCHES"
 
-          if ! echo "$ARCHES" | grep -qw x86_64; then
-            echo "ERROR: Main executable lacks x86_64."
+
+          if ! echo "$ARCHES" \
+            | grep -qw x86_64; then
+
+            echo "ERROR:"
+            echo "Main executable lacks x86_64."
+
             exit 1
           fi
 
-          if echo "$ARCHES" | grep -qw arm64; then
-            echo "ERROR: arm64 unexpectedly remains."
+
+          if echo "$ARCHES" \
+            | grep -qw arm64; then
+
+            echo "ERROR:"
+            echo "arm64 unexpectedly remains."
+
             exit 1
           fi
 
 
       # ============================================================
-      # Audit all embedded Mach-O binaries
+      # Audit every Mach-O deployment target
+      #
+      # This is where we will discover whether FlutterMacOS.framework
+      # or another remaining native plugin itself requires Catalina
+      # or newer.
       # ============================================================
 
       - name: Audit Mach-O deployment targets
@@ -1284,63 +1950,79 @@ jobs:
           mkdir -p ../diagnostics
 
           REPORT="../diagnostics/macho-deployment-targets.txt"
+
           : > "$REPORT"
 
-          find "$APP" -type f -print0 |
-          while IFS= read -r -d '' FILE; do
 
-            if file "$FILE" | grep -q "Mach-O"; then
+          find "$APP" \
+            -type f \
+            -print0 \
+          | while IFS= read -r -d '' FILE; do
 
-              {
-                echo
-                echo "============================================================"
-                echo "$FILE"
-                echo "============================================================"
+              if file "$FILE" \
+                | grep -q "Mach-O"; then
 
-                file "$FILE"
+                {
+                  echo
+                  echo "============================================================"
+                  echo "$FILE"
+                  echo "============================================================"
 
-                echo
-                echo "--- Architectures ---"
-                lipo -archs "$FILE" 2>/dev/null || true
+                  file "$FILE"
 
-                echo
-                echo "--- Deployment load commands ---"
+                  echo
+                  echo "--- Architectures ---"
 
-                otool -l "$FILE" |
-                awk '
-                  /cmd LC_VERSION_MIN_MACOSX/ {
-                    capture=1
-                    count=0
-                  }
+                  lipo \
+                    -archs \
+                    "$FILE" \
+                    2>/dev/null \
+                    || true
 
-                  /cmd LC_BUILD_VERSION/ {
-                    capture=1
-                    count=0
-                  }
+                  echo
+                  echo "--- Deployment load commands ---"
 
-                  capture {
-                    print
-                    count++
+                  otool \
+                    -l \
+                    "$FILE" \
+                  | awk '
+                      /cmd LC_VERSION_MIN_MACOSX/ {
+                        capture=1
+                        count=0
+                      }
 
-                    if (count >= 10) {
-                      capture=0
-                    }
-                  }
-                '
+                      /cmd LC_BUILD_VERSION/ {
+                        capture=1
+                        count=0
+                      }
 
-                echo
-                echo "--- Linked libraries ---"
-                otool -L "$FILE" || true
+                      capture {
+                        print
+                        count++
 
-              } | tee -a "$REPORT"
+                        if (count >= 10) {
+                          capture=0
+                        }
+                      }
+                    '
 
-            fi
+                  echo
+                  echo "--- Linked libraries ---"
 
-          done
+                  otool \
+                    -L \
+                    "$FILE" \
+                    || true
+
+                } | tee -a "$REPORT"
+
+              fi
+
+            done
 
 
       # ============================================================
-      # Code-signing inspection
+      # Signature / entitlement inspection
       # ============================================================
 
       - name: Inspect code signatures
@@ -1353,12 +2035,18 @@ jobs:
 
           REPORT="../diagnostics/codesign-report.txt"
 
+
           {
             echo "============================================================"
             echo "Main application"
             echo "============================================================"
 
-            codesign -dvvv "$APP" 2>&1 || true
+            codesign \
+              -dvvv \
+              "$APP" \
+              2>&1 \
+              || true
+
 
             echo
             echo "============================================================"
@@ -1369,32 +2057,44 @@ jobs:
               -d \
               --entitlements :- \
               "$APP" \
-              2>&1 || true
+              2>&1 \
+              || true
+
 
             echo
             echo "============================================================"
             echo "Extensions"
             echo "============================================================"
 
-            find "$APP" -type d -name '*.appex' -print |
-            while read -r EXTENSION; do
 
-              echo
-              echo "------------------------------------------------------------"
-              echo "$EXTENSION"
-              echo "------------------------------------------------------------"
+            find "$APP" \
+              -type d \
+              -name '*.appex' \
+              -print \
+            | while read -r EXTENSION; do
 
-              codesign -dvvv "$EXTENSION" 2>&1 || true
+                echo
+                echo "------------------------------------------------------------"
+                echo "$EXTENSION"
+                echo "------------------------------------------------------------"
 
-              codesign \
-                -d \
-                --entitlements :- \
-                "$EXTENSION" \
-                2>&1 || true
+                codesign \
+                  -dvvv \
+                  "$EXTENSION" \
+                  2>&1 \
+                  || true
 
-            done
+                codesign \
+                  -d \
+                  --entitlements :- \
+                  "$EXTENSION" \
+                  2>&1 \
+                  || true
+
+              done
 
           } | tee "$REPORT"
+
 
           codesign \
             --verify \
@@ -1416,9 +2116,12 @@ jobs:
 
           mkdir -p release
 
+
           OUTPUT="release/LocalSend-macOS-High-Sierra-10.13-x86_64.zip"
 
+
           rm -f "$OUTPUT"
+
 
           ditto \
             -c \
@@ -1428,13 +2131,17 @@ jobs:
             "$APP" \
             "$OUTPUT"
 
+
           echo
           echo "Created:"
-          ls -lh "$OUTPUT"
+
+          ls \
+            -lh \
+            "$OUTPUT"
 
 
       # ============================================================
-      # Upload successful application
+      # Successful build artifact
       # ============================================================
 
       - name: Upload High Sierra build
@@ -1458,58 +2165,103 @@ jobs:
 
           mkdir -p diagnostics
 
+
           cp \
             app/macos/Runner.xcodeproj/project.pbxproj \
             diagnostics/project.pbxproj.after-patch \
             2>/dev/null
+
 
           cp \
             app/macos/Podfile \
             diagnostics/Podfile.after-patch \
             2>/dev/null
 
+
+          cp \
+            app/macos/Podfile.lock \
+            diagnostics/Podfile.lock.after-patch \
+            2>/dev/null
+
+
+          cp \
+            app/pubspec.yaml \
+            diagnostics/pubspec.yaml.after-foss-strip \
+            2>/dev/null
+
+
           cp \
             app/macos/Runner/Configs/Release.xcconfig \
             diagnostics/Release.xcconfig.after-patch \
             2>/dev/null
+
 
           cp \
             swiftpm-resolve.log \
             diagnostics/swiftpm-resolve.log \
             2>/dev/null
 
+
           cp \
             flutter-config-only.log \
             diagnostics/flutter-config-only.log \
             2>/dev/null
+
 
           cp \
             flutter-macos-build.log \
             diagnostics/flutter-macos-build.log \
             2>/dev/null
 
-          # Package.resolved is diagnostic only.
+
+          cp \
+            flutter-pub-deps.txt \
+            diagnostics/flutter-pub-deps.txt \
+            2>/dev/null
+
+
+          # --------------------------------------------------------
+          # Collect Package.resolved files dynamically.
+          # --------------------------------------------------------
+
           python3 <<'PY'
           from pathlib import Path
           import shutil
 
-          source = Path("app/macos")
-          destination = Path("diagnostics")
+
+          source = Path(
+              "app/macos"
+          )
+
+          destination = Path(
+              "diagnostics"
+          )
+
 
           destination.mkdir(
               parents=True,
               exist_ok=True,
           )
 
+
           files = sorted(
               path
-              for path in source.rglob("Package.resolved")
+              for path in source.rglob(
+                  "Package.resolved"
+              )
               if path.parent.name == "swiftpm"
           )
 
-          for index, path in enumerate(files, start=1):
 
-              relative = path.relative_to(source)
+          for index, path in enumerate(
+              files,
+              start=1,
+          ):
+
+              relative = path.relative_to(
+                  source
+              )
+
 
               safe_name = (
                   str(relative)
@@ -1517,19 +2269,33 @@ jobs:
                   .replace(" ", "_")
               )
 
+
               output = destination / (
                   f"Package.resolved."
-                  f"{index}__{safe_name}"
+                  f"{index}__"
+                  f"{safe_name}"
               )
 
-              shutil.copy2(path, output)
+
+              shutil.copy2(
+                  path,
+                  output,
+              )
+
 
               print(
-                  f"Copied {path} -> {output}"
+                  f"Copied "
+                  f"{path} -> {output}"
               )
           PY
 
+
+          # --------------------------------------------------------
+          # Collect patched gal.
+          # --------------------------------------------------------
+
           PUB_CACHE_ROOT="${PUB_CACHE:-$HOME/.pub-cache}"
+
 
           GAL_SWIFT="$(
             find "$PUB_CACHE_ROOT" \
@@ -1539,6 +2305,7 @@ jobs:
               -quit
           )"
 
+
           GAL_PODSPEC="$(
             find "$PUB_CACHE_ROOT" \
               -type f \
@@ -1546,6 +2313,7 @@ jobs:
               -print \
               -quit
           )"
+
 
           if [ -n "$GAL_SWIFT" ]; then
 
@@ -1559,6 +2327,7 @@ jobs:
               diagnostics/GalPlugin.swift.original \
               2>/dev/null
           fi
+
 
           if [ -n "$GAL_PODSPEC" ]; then
 
