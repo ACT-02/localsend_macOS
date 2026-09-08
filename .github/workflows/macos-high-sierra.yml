@@ -223,41 +223,86 @@ jobs:
           set -euxo pipefail
           mkdir -p diagnostics
 
-          OBJECTIVE_C_ROOT="$(
-            python3 <<'PY'
-          import json
+          # Do not resolve objective_c through .dart_tool/package_config.json here.
+          # The package is a Dart Native Asset dependency rather than a normal
+          # Flutter macOS plugin, and all we need is the exact cached 9.5.0
+          # package that flutter pub get has already fetched.
+          #
+          # Searching the Pub cache directly also avoids URI/path corruption
+          # from package_config handling and gives us deterministic diagnostics.
+          PUB_CACHE_ROOT="${PUB_CACHE:-$HOME/.pub-cache}"
+
+          echo "Pub cache root: $PUB_CACHE_ROOT"
+          test -d "$PUB_CACHE_ROOT"
+
+          CANDIDATES_FILE="diagnostics/objective_c-candidates.txt"
+          : > "$CANDIDATES_FILE"
+
+          find "$PUB_CACHE_ROOT" \
+            -type f \
+            -path '*/objective_c-9.5.0/hook/build.dart' \
+            -print \
+            | sort \
+            | tee "$CANDIDATES_FILE"
+
+          if [ ! -s "$CANDIDATES_FILE" ]; then
+            echo "ERROR: objective_c 9.5.0 hook/build.dart was not found in the Pub cache."
+            echo "Nearby objective_c cache entries:"
+            find "$PUB_CACHE_ROOT" \
+              -maxdepth 5 \
+              -iname '*objective_c*' \
+              -print \
+              | sort \
+              | head -200 \
+              || true
+            exit 1
+          fi
+
+          # Select the candidate in Python rather than using Bash 4-only
+          # helpers such as mapfile. GitHub's macOS /bin/bash is still 3.2.
+          HOOK="$(
+            python3 - "$CANDIDATES_FILE" <<'PY'
+          import sys
           from pathlib import Path
-          from urllib.parse import unquote, urlparse
 
-          config_path = Path("app/.dart_tool/package_config.json").resolve()
-          data = json.loads(config_path.read_text())
+          candidates = [
+              line.strip()
+              for line in Path(sys.argv[1]).read_text().splitlines()
+              if line.strip()
+          ]
 
-          entry = next(
-              (package for package in data.get("packages", []) if package.get("name") == "objective_c"),
-              None,
-          )
+          canonical = [
+              candidate
+              for candidate in candidates
+              if "/hosted/pub.dev/objective_c-9.5.0/hook/build.dart" in candidate
+          ]
 
-          if entry is None:
-              raise SystemExit("ERROR: objective_c is not present in package_config.json.")
-
-          root_uri = entry["rootUri"]
-
-          if root_uri.startswith("file:"):
-              parsed = urlparse(root_uri)
-              root = Path(unquote(parsed.path))
+          if len(canonical) == 1:
+              print(canonical[0])
+          elif len(candidates) == 1:
+              print(candidates[0])
           else:
-              root = (config_path.parent / unquote(root_uri)).resolve()
-
-          print(root)
+              raise SystemExit(
+                  "ERROR: Multiple objective_c 9.5.0 hook candidates were found "
+                  "and no unique canonical hosted/pub.dev copy could be selected:\n  "
+                  + "\n  ".join(candidates)
+              )
           PY
           )"
 
-          echo "objective_c root: $OBJECTIVE_C_ROOT"
-          echo "$OBJECTIVE_C_ROOT" > diagnostics/objective_c-root.txt
-
-          HOOK="$OBJECTIVE_C_ROOT/hook/build.dart"
+          OBJECTIVE_C_ROOT="${HOOK%/hook/build.dart}"
           PUBSPEC="$OBJECTIVE_C_ROOT/pubspec.yaml"
 
+          echo "objective_c root: $OBJECTIVE_C_ROOT"
+          echo "objective_c hook: $HOOK"
+
+          printf '%s\n' "$OBJECTIVE_C_ROOT" \
+            > diagnostics/objective_c-root.txt
+
+          printf '%s\n' "$HOOK" \
+            > diagnostics/objective_c-hook.txt
+
+          test -d "$OBJECTIVE_C_ROOT"
           test -f "$HOOK"
           test -f "$PUBSPEC"
 
