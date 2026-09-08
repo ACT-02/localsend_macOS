@@ -50,8 +50,7 @@ jobs:
 
 
       # ============================================================
-      # Flutter 3.41.9 generates FlutterMacOS.podspec with macOS 10.15.
-      # Patch the generator itself so every regeneration uses 10.13.
+      # FlutterMacOS fake podspec
       # ============================================================
 
       - name: Backport FlutterMacOS podspec generator
@@ -179,7 +178,7 @@ jobs:
 
 
       # ============================================================
-      # Remove StoreKit / in_app_purchase using LocalSend's FOSS path.
+      # Remove StoreKit / IAP
       # ============================================================
 
       - name: Remove in-app purchases for High Sierra
@@ -316,7 +315,7 @@ jobs:
 
 
       # ============================================================
-      # Verify StoreKit is absent
+      # Verify StoreKit removal
       # ============================================================
 
       - name: Verify in-app purchase plugin is gone
@@ -360,11 +359,7 @@ jobs:
 
 
       # ============================================================
-      # Lower all CocoaPods-backed Flutter macOS plugin declarations
-      # to macOS 10.13.
-      #
-      # This only bypasses podspec minimum-version declarations.
-      # Actual API incompatibilities are handled separately.
+      # Lower Flutter plugin podspecs to 10.13
       # ============================================================
 
       - name: Backport macOS Flutter plugin podspecs
@@ -514,7 +509,7 @@ jobs:
 
 
       # ============================================================
-      # gal 2.3.3 High Sierra shim
+      # gal High Sierra shim
       # ============================================================
 
       - name: Backport gal for High Sierra
@@ -624,7 +619,6 @@ jobs:
                 result(nil)
 
               default:
-
                 result(
                   FlutterMethodNotImplemented
                 )
@@ -647,13 +641,7 @@ jobs:
 
 
       # ============================================================
-      # connectivity_plus 7.3.1
-      #
-      # Replace Network.framework / NWPathMonitor with:
-      # - SystemConfiguration
-      # - CoreWLAN
-      # - getifaddrs()
-      # - DispatchSourceTimer
+      # connectivity_plus High Sierra provider
       # ============================================================
 
       - name: Backport connectivity_plus for High Sierra
@@ -1207,8 +1195,6 @@ jobs:
           PY
 
 
-          # Validate actual code, ignoring comments.
-
           python3 - "$CONNECTIVITY_PROVIDER" <<'PY'
           import re
           import sys
@@ -1361,7 +1347,7 @@ jobs:
 
 
       # ============================================================
-      # LocalSend Xcode project / Podfile
+      # LocalSend project / Podfile
       # ============================================================
 
       - name: Patch LocalSend for High Sierra
@@ -1405,6 +1391,20 @@ jobs:
                   "found in pbxproj."
               )
 
+
+          # --------------------------------------------------------
+          # Force Intel-only.
+          #
+          # IMPORTANT:
+          #
+          # ONLY_ACTIVE_ARCH must be NO for Release.
+          #
+          # LaunchAtLogin-Legacy uses this setting to determine
+          # whether it should perform release cleanup.
+          #
+          # ARCHS=x86_64 still guarantees Intel-only output.
+          # --------------------------------------------------------
+
           if (
               "LOCALSEND_LEGACY_MACOS_TARGET = 10.13;"
               not in text
@@ -1418,13 +1418,27 @@ jobs:
                   "\t\t\t\t"
                   "EXCLUDED_ARCHS = arm64;\n"
                   "\t\t\t\t"
-                  "ONLY_ACTIVE_ARCH = YES;\n"
+                  "ONLY_ACTIVE_ARCH = NO;\n"
               )
 
               text = text.replace(
                   "buildSettings = {\n",
                   replacement,
               )
+
+
+          # If an earlier form is somehow already present, normalize
+          # all ONLY_ACTIVE_ARCH values to NO.
+          text = re.sub(
+              r'ONLY_ACTIVE_ARCH\s*=\s*(?:YES|NO);',
+              'ONLY_ACTIVE_ARCH = NO;',
+              text,
+          )
+
+
+          # --------------------------------------------------------
+          # Signing
+          # --------------------------------------------------------
 
           text = re.sub(
               r'DEVELOPMENT_TEAM'
@@ -1581,7 +1595,10 @@ jobs:
 
           ARCHS = x86_64
           EXCLUDED_ARCHS = arm64
-          ONLY_ACTIVE_ARCH = YES
+
+          // LaunchAtLogin-Legacy requires this to be NO for
+          // distribution/release builds.
+          ONLY_ACTIVE_ARCH = NO
 
           CODE_SIGN_IDENTITY = -
           CODE_SIGN_STYLE = Manual
@@ -1663,7 +1680,7 @@ jobs:
                   + "\n"
                   + "      "
                   + "config.build_settings"
-                  + "['ONLY_ACTIVE_ARCH'] = 'YES'"
+                  + "['ONLY_ACTIVE_ARCH'] = 'NO'"
               )
 
               text = text.replace(
@@ -1671,6 +1688,11 @@ jobs:
                   replacement,
                   1,
               )
+
+          text = text.replace(
+              "config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES'",
+              "config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'",
+          )
 
           if "target 'ShareExtension' do" not in text:
               share_target = """
@@ -1704,7 +1726,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # AppDelegate MainActor compatibility
+          # AppDelegate MainActor
           # --------------------------------------------------------
 
           python3 <<'PY'
@@ -1751,16 +1773,6 @@ jobs:
 
       # ============================================================
       # ShareExtension High Sierra backport
-      #
-      # Remove:
-      # - SwiftUI
-      # - UniformTypeIdentifiers / UTType
-      # - Task
-      # - Swift async/await
-      # - withCheckedThrowingContinuation
-      # - modern NSWorkspace.OpenConfiguration
-      #
-      # Keep normal Grand Central Dispatch `.async {}`.
       # ============================================================
 
       - name: Backport ShareExtension for High Sierra
@@ -1783,10 +1795,6 @@ jobs:
             "$SHARE_CONTROLLER" \
             "${SHARE_CONTROLLER}.high-sierra-original"
 
-
-          # --------------------------------------------------------
-          # Utilities.swift
-          # --------------------------------------------------------
 
           cat > "$UTILITIES" <<'SWIFT'
           import AppKit
@@ -2003,10 +2011,6 @@ jobs:
           }
           SWIFT
 
-
-          # --------------------------------------------------------
-          # ShareController.swift
-          # --------------------------------------------------------
 
           cat > "$SHARE_CONTROLLER" <<'SWIFT'
           import Foundation
@@ -2290,21 +2294,6 @@ jobs:
           cat "$SHARE_CONTROLLER"
 
 
-          # --------------------------------------------------------
-          # Validate actual Swift code.
-          #
-          # IMPORTANT:
-          # Do NOT reject every token named "async".
-          #
-          # DispatchQueue.main.async { ... } is valid GCD.
-          #
-          # We only reject actual Swift Concurrency constructs:
-          #
-          #   func foo() async
-          #   await ...
-          #   Task { ... }
-          # --------------------------------------------------------
-
           python3 - \
             "$UTILITIES" \
             "$SHARE_CONTROLLER" <<'PY'
@@ -2455,16 +2444,6 @@ jobs:
 
 
           print(
-              "PASS: ShareExtension has no "
-              "Swift Concurrency dependency."
-          )
-
-          print(
-              "PASS: DispatchQueue.main.async "
-              "is retained as normal GCD."
-          )
-
-          print(
               "PASS: ShareExtension High Sierra "
               "source validation passed."
           )
@@ -2554,6 +2533,28 @@ jobs:
           fi
 
 
+          if grep -q \
+            'ONLY_ACTIVE_ARCH = YES;' \
+            "$PBX"; then
+
+            echo "ERROR:"
+            echo "ONLY_ACTIVE_ARCH=YES remains in pbxproj."
+
+            exit 1
+          fi
+
+
+          if grep -q \
+            "config.build_settings\['ONLY_ACTIVE_ARCH'\] = 'YES'" \
+            "$PODFILE"; then
+
+            echo "ERROR:"
+            echo "ONLY_ACTIVE_ARCH=YES remains in Podfile."
+
+            exit 1
+          fi
+
+
           ruby -c \
             "$PODFILE"
 
@@ -2563,10 +2564,7 @@ jobs:
 
 
       # ============================================================
-      # First Flutter native-config pass.
-      #
-      # Allow CocoaPods failure here so the standalone pod install
-      # below can print the actual resolver error.
+      # First Flutter config pass
       # ============================================================
 
       - name: Generate Flutter macOS configuration - first pass
@@ -2742,7 +2740,7 @@ jobs:
 
 
       # ============================================================
-      # Final Flutter native-config pass
+      # Final Flutter config pass
       # ============================================================
 
       - name: Finalize Flutter macOS configuration
@@ -2759,7 +2757,7 @@ jobs:
 
 
       # ============================================================
-      # Verify generated native dependency graph
+      # Native graph validation
       # ============================================================
 
       - name: Verify generated native dependency graph
@@ -3070,6 +3068,13 @@ jobs:
                   flags=re.MULTILINE,
               )
 
+              only_active = re.findall(
+                  r"^\s*ONLY_ACTIVE_ARCH"
+                  r"\s*=\s*(.*?)\s*$",
+                  text,
+                  flags=re.MULTILINE,
+              )
+
               print()
               print(path)
 
@@ -3088,11 +3093,18 @@ jobs:
                   excluded[:3],
               )
 
+              print(
+                  "  ONLY_ACTIVE_ARCH:",
+                  only_active[:3],
+              )
+
+
               if not deployments:
                   raise SystemExit(
                       f"ERROR: {path}: "
                       "deployment target missing."
                   )
+
 
               if deployments[0] != "10.13":
                   raise SystemExit(
@@ -3101,15 +3113,18 @@ jobs:
                       f"{deployments[0]!r}"
                   )
 
+
               if not archs:
                   raise SystemExit(
                       f"ERROR: {path}: ARCHS missing."
                   )
 
+
               if "x86_64" not in archs[0].split():
                   raise SystemExit(
                       f"ERROR: {path}: x86_64 missing."
                   )
+
 
               if (
                   excluded
@@ -3120,6 +3135,23 @@ jobs:
                       f"ERROR: {path}: arm64 not excluded."
                   )
 
+
+              if not only_active:
+                  raise SystemExit(
+                      f"ERROR: {path}: "
+                      "ONLY_ACTIVE_ARCH missing."
+                  )
+
+
+              if only_active[0] != "NO":
+                  raise SystemExit(
+                      f"ERROR: {path}: "
+                      f"ONLY_ACTIVE_ARCH = "
+                      f"{only_active[0]!r}; "
+                      "expected NO."
+                  )
+
+
           print()
           print(
               "Effective build settings are correct."
@@ -3128,10 +3160,7 @@ jobs:
 
 
       # ============================================================
-      # Flutter Engine audit before build.
-      #
-      # The fake FlutterMacOS podspec being 10.13 does not prove
-      # that the actual engine binary has a 10.13 minimum OS.
+      # Flutter Engine audit before build
       # ============================================================
 
       - name: Inspect FlutterMacOS engine
@@ -3244,6 +3273,7 @@ jobs:
         env:
           ARCHS: x86_64
           EXCLUDED_ARCHS: arm64
+          ONLY_ACTIVE_ARCH: "NO"
         run: |
           set -o pipefail
 
@@ -3252,6 +3282,7 @@ jobs:
           echo
           echo "Target OS:          macOS High Sierra 10.13"
           echo "Architecture:       x86_64"
+          echo "ONLY_ACTIVE_ARCH:   NO"
           echo "Flutter:            ${FLUTTER_VERSION}"
           echo "Rust:               ${RUST_VERSION}"
           echo "DockProgress:       3.2.0"
@@ -3271,8 +3302,6 @@ jobs:
 
       # ============================================================
       # Compiler diagnostics
-      #
-      # Real errors and availability warnings are separated.
       # ============================================================
 
       - name: Extract compiler errors
@@ -3493,7 +3522,7 @@ jobs:
 
 
       # ============================================================
-      # Locate built app
+      # Locate app
       # ============================================================
 
       - name: Locate built application
@@ -3545,7 +3574,253 @@ jobs:
 
 
       # ============================================================
-      # Verify x86_64 main executable
+      # Repair LaunchAtLogin helper signature
+      #
+      # The helper is copied and modified by LaunchAtLogin's build
+      # script. On this ad-hoc CI build its Info.plist resource seal
+      # can end up invalid after the remaining Xcode build phases.
+      #
+      # Do NOT use codesign --deep to re-sign the entire app.
+      #
+      # Sign inside-out:
+      #
+      #   1. Preserve main app entitlements
+      #   2. Re-sign LaunchAtLoginHelper.app only
+      #   3. Verify helper
+      #   4. Re-sign outer LocalSend.app last
+      # ============================================================
+
+      - name: Repair LaunchAtLogin helper signature
+        working-directory: app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p \
+            ../diagnostics
+
+
+          HELPER="$APP/Contents/Library/LoginItems/LaunchAtLoginHelper.app"
+
+          MAIN_ENTITLEMENTS="../diagnostics/LocalSend.entitlements.before-resign.plist"
+
+          HELPER_ENTITLEMENTS="../diagnostics/LaunchAtLoginHelper.entitlements.plist"
+
+
+          if [ ! -d "$HELPER" ]; then
+
+            echo "ERROR:"
+            echo "LaunchAtLoginHelper.app is missing:"
+            echo "$HELPER"
+
+            exit 1
+          fi
+
+
+          echo "============================================================"
+          echo "LaunchAtLogin helper before repair"
+          echo "============================================================"
+
+
+          find "$HELPER" \
+            -maxdepth 3 \
+            -print \
+            | sort \
+            | head -200
+
+
+          echo
+          echo "============================================================"
+          echo "Helper Info.plist"
+          echo "============================================================"
+
+
+          test -f \
+            "$HELPER/Contents/Info.plist"
+
+
+          plutil -lint \
+            "$HELPER/Contents/Info.plist"
+
+
+          cp \
+            "$HELPER/Contents/Info.plist" \
+            ../diagnostics/LaunchAtLoginHelper.Info.plist.before-resign
+
+
+          /usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleIdentifier' \
+            "$HELPER/Contents/Info.plist" \
+            | tee \
+              ../diagnostics/LaunchAtLoginHelper.bundle-id.txt
+
+
+          echo
+          echo "============================================================"
+          echo "Main app entitlements before repair"
+          echo "============================================================"
+
+
+          codesign \
+            --display \
+            --entitlements - \
+            --xml \
+            "$APP" \
+            2> ../diagnostics/LocalSend.codesign-display.before-resign.txt \
+          | plutil \
+              -convert xml1 \
+              -o "$MAIN_ENTITLEMENTS" \
+              -
+
+
+          plutil -lint \
+            "$MAIN_ENTITLEMENTS"
+
+
+          cat \
+            "$MAIN_ENTITLEMENTS"
+
+
+          echo
+          echo "============================================================"
+          echo "LaunchAtLogin helper entitlements"
+          echo "============================================================"
+
+
+          # LaunchAtLogin-Legacy 5.0.2 ships exactly this entitlement
+          # for the legacy login helper.
+          cat > "$HELPER_ENTITLEMENTS" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.app-sandbox</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+
+          plutil -lint \
+            "$HELPER_ENTITLEMENTS"
+
+
+          cat \
+            "$HELPER_ENTITLEMENTS"
+
+
+          echo
+          echo "============================================================"
+          echo "Existing helper signature"
+          echo "============================================================"
+
+
+          codesign \
+            --display \
+            --verbose=4 \
+            "$HELPER" \
+            2>&1 \
+            | tee \
+              ../diagnostics/LaunchAtLoginHelper.codesign.before-resign.txt \
+            || true
+
+
+          echo
+          echo "============================================================"
+          echo "Re-sign helper only"
+          echo "============================================================"
+
+
+          # Do not use --deep here.
+          #
+          # The embedded Swift runtime dylibs were already signed by
+          # the LaunchAtLogin package and previously validated. We
+          # only replace the helper app's outer resource seal.
+          codesign \
+            --force \
+            --sign - \
+            --options runtime \
+            --preserve-metadata=identifier,requirements \
+            --entitlements \
+              "$HELPER_ENTITLEMENTS" \
+            "$HELPER"
+
+
+          codesign \
+            --verify \
+            --strict \
+            --verbose=4 \
+            "$HELPER" \
+            2>&1 \
+            | tee \
+              ../diagnostics/LaunchAtLoginHelper.verify.after-resign.txt
+
+
+          echo
+          echo "============================================================"
+          echo "Re-sign outer LocalSend.app last"
+          echo "============================================================"
+
+
+          # Re-signing the nested helper changes the outer app's
+          # resource seal, therefore the parent app must be signed
+          # again after the helper.
+          #
+          # Preserve the entitlements Xcode actually embedded instead
+          # of using Runner/Release.entitlements directly, because the
+          # source file contains build-setting substitutions.
+          codesign \
+            --force \
+            --sign - \
+            --preserve-metadata=identifier,requirements,flags \
+            --entitlements \
+              "$MAIN_ENTITLEMENTS" \
+            "$APP"
+
+
+          echo
+          echo "============================================================"
+          echo "Main app signature after repair"
+          echo "============================================================"
+
+
+          codesign \
+            --display \
+            --verbose=4 \
+            "$APP" \
+            2>&1 \
+            | tee \
+              ../diagnostics/LocalSend.codesign.after-resign.txt
+
+
+          echo
+          echo "============================================================"
+          echo "Main app entitlements after repair"
+          echo "============================================================"
+
+
+          codesign \
+            --display \
+            --entitlements - \
+            --xml \
+            "$APP" \
+            2>/dev/null \
+          | plutil \
+              -convert xml1 \
+              -o ../diagnostics/LocalSend.entitlements.after-resign.plist \
+              -
+
+
+          plutil -lint \
+            ../diagnostics/LocalSend.entitlements.after-resign.plist
+
+
+          cat \
+            ../diagnostics/LocalSend.entitlements.after-resign.plist
+
+
+      # ============================================================
+      # x86_64 verification
       # ============================================================
 
       - name: Verify x86_64 application
@@ -3593,7 +3868,7 @@ jobs:
 
 
       # ============================================================
-      # Audit all built Mach-O deployment targets
+      # Mach-O audit
       # ============================================================
 
       - name: Audit Mach-O deployment targets
@@ -3678,7 +3953,7 @@ jobs:
 
 
       # ============================================================
-      # Code signatures / entitlements
+      # Signature / entitlement inspection
       # ============================================================
 
       - name: Inspect code signatures
@@ -3699,7 +3974,8 @@ jobs:
             echo "============================================================"
 
             codesign \
-              -dvvv \
+              --display \
+              --verbose=4 \
               "$APP" \
               2>&1 \
               || true
@@ -3710,18 +3986,56 @@ jobs:
             echo "Main entitlements"
             echo "============================================================"
 
+
+            # Modern syntax: '-' rather than deprecated ':-'.
             codesign \
-              -d \
-              --entitlements :- \
+              --display \
+              --entitlements - \
+              --xml \
               "$APP" \
-              2>&1 \
+              2>/dev/null \
               || true
+
+
+            echo
+            echo "============================================================"
+            echo "LaunchAtLogin helper"
+            echo "============================================================"
+
+
+            HELPER="$APP/Contents/Library/LoginItems/LaunchAtLoginHelper.app"
+
+
+            if [ -d "$HELPER" ]; then
+
+              codesign \
+                --display \
+                --verbose=4 \
+                "$HELPER" \
+                2>&1 \
+                || true
+
+
+              echo
+              echo "LaunchAtLogin helper entitlements:"
+
+
+              codesign \
+                --display \
+                --entitlements - \
+                --xml \
+                "$HELPER" \
+                2>/dev/null \
+                || true
+
+            fi
 
 
             echo
             echo "============================================================"
             echo "Extensions"
             echo "============================================================"
+
 
             find "$APP" \
               -type d \
@@ -3734,17 +4048,21 @@ jobs:
                 echo "$EXTENSION"
                 echo "------------------------------------------------------------"
 
+
                 codesign \
-                  -dvvv \
+                  --display \
+                  --verbose=4 \
                   "$EXTENSION" \
                   2>&1 \
                   || true
 
+
                 codesign \
-                  -d \
-                  --entitlements :- \
+                  --display \
+                  --entitlements - \
+                  --xml \
                   "$EXTENSION" \
-                  2>&1 \
+                  2>/dev/null \
                   || true
 
               done
@@ -3752,6 +4070,14 @@ jobs:
           } | tee "$REPORT"
 
 
+          echo
+          echo "============================================================"
+          echo "Verify complete application bundle"
+          echo "============================================================"
+
+
+          # Verification may be deep. Signing above was intentionally
+          # NOT done using --deep.
           codesign \
             --verify \
             --deep \
@@ -3791,16 +4117,43 @@ jobs:
 
 
       # ============================================================
-      # Successful build artifact
+      # Upload successful application
+      #
+      # Retry once if GitHub Artifact Service itself times out.
       # ============================================================
 
       - name: Upload High Sierra build
+        id: upload_build
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: LocalSend-macOS-High-Sierra-10.13-x86_64
           path: app/release/LocalSend-macOS-High-Sierra-10.13-x86_64.zip
           if-no-files-found: error
           retention-days: 30
+
+
+      - name: Retry High Sierra build upload
+        id: upload_build_retry
+        if: steps.upload_build.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalSend-macOS-High-Sierra-10.13-x86_64-retry
+          path: app/release/LocalSend-macOS-High-Sierra-10.13-x86_64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+
+      - name: Verify High Sierra build upload
+        if: >
+          steps.upload_build.outcome == 'failure' &&
+          steps.upload_build_retry.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "ERROR:"
+          echo "Both build artifact upload attempts failed."
+          exit 1
 
 
       # ============================================================
@@ -3920,7 +4273,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # ShareExtension sources
+          # ShareExtension
           # --------------------------------------------------------
 
           cp \
@@ -3948,7 +4301,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Package.resolved files
+          # Package.resolved
           # --------------------------------------------------------
 
           python3 <<'PY'
@@ -4079,7 +4432,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # connectivity_plus source
+          # connectivity_plus
           # --------------------------------------------------------
 
           CONNECTIVITY_ROOT="$(
@@ -4149,7 +4502,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # gal source
+          # gal
           # --------------------------------------------------------
 
           PUB_CACHE_ROOT="${PUB_CACHE:-$HOME/.pub-cache}"
@@ -4179,11 +4532,72 @@ jobs:
           fi
 
 
-      - name: Upload build diagnostics
+      # ============================================================
+      # Pack diagnostics into one file.
+      #
+      # This reduces upload bookkeeping and avoids trying to upload
+      # dozens of individual diagnostic files.
+      # ============================================================
+
+      - name: Pack diagnostics
         if: always()
+        shell: bash
+        run: |
+          set +e
+
+          rm -f \
+            LocalSend-High-Sierra-build-diagnostics.zip
+
+
+          if [ -d diagnostics ]; then
+
+            ditto \
+              -c \
+              -k \
+              --sequesterRsrc \
+              --keepParent \
+              diagnostics \
+              LocalSend-High-Sierra-build-diagnostics.zip
+
+
+            ls -lh \
+              LocalSend-High-Sierra-build-diagnostics.zip
+
+          else
+
+            echo "No diagnostics directory exists."
+
+          fi
+
+
+      # ============================================================
+      # Diagnostics artifact
+      #
+      # GitHub's ArtifactService can occasionally time out while
+      # creating an artifact. Do not let that hide the actual build
+      # result. Retry once under a different artifact name.
+      # ============================================================
+
+      - name: Upload build diagnostics
+        id: upload_diagnostics
+        if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: LocalSend-High-Sierra-build-diagnostics
-          path: diagnostics/
+          path: LocalSend-High-Sierra-build-diagnostics.zip
+          if-no-files-found: warn
+          retention-days: 30
+
+
+      - name: Retry build diagnostics upload
+        if: >
+          always() &&
+          steps.upload_diagnostics.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalSend-High-Sierra-build-diagnostics-retry
+          path: LocalSend-High-Sierra-build-diagnostics.zip
           if-no-files-found: warn
           retention-days: 30
