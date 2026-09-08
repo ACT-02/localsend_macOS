@@ -50,9 +50,10 @@ jobs:
 
 
       # ============================================================
-      # FlutterMacOS podspec generator:
-      # Flutter 3.41.9 -> macOS 10.15
-      # Backport      -> macOS 10.13
+      # FlutterMacOS fake CocoaPods spec
+      #
+      # Flutter 3.41.9 generates FlutterMacOS.podspec with 10.15.
+      # Patch the generator so every regeneration produces 10.13.
       # ============================================================
 
       - name: Backport FlutterMacOS podspec generator
@@ -95,7 +96,7 @@ jobs:
 
               if count != 1:
                   raise SystemExit(
-                      "ERROR: Could not locate FlutterMacOS "
+                      "ERROR: Could not find FlutterMacOS "
                       "10.15 deployment target in podhelper.rb."
                   )
 
@@ -109,7 +110,9 @@ jobs:
                   "does not target 10.13."
               )
 
-          print("FlutterMacOS podspec generator -> macOS 10.13")
+          print(
+              "FlutterMacOS podspec generator patched to 10.13."
+          )
           PY
 
           echo
@@ -178,7 +181,9 @@ jobs:
 
 
       # ============================================================
-      # Remove StoreKit / IAP via LocalSend FOSS path
+      # Remove StoreKit / in_app_purchase
+      #
+      # Use LocalSend's FOSS-removal markers.
       # ============================================================
 
       - name: Remove in-app purchases for High Sierra
@@ -219,7 +224,9 @@ jobs:
           )
 
           dart_files = [
-              Path("app/lib/config/init.dart"),
+              Path(
+                  "app/lib/config/init.dart"
+              ),
               Path(
                   "app/lib/pages/donation/"
                   "donation_page.dart"
@@ -235,12 +242,12 @@ jobs:
 
               if "// [FOSS_REMOVE_START]" not in text:
                   raise SystemExit(
-                      f"ERROR: Missing FOSS_REMOVE_START in {path}"
+                      f"ERROR: Missing FOSS_REMOVE_START: {path}"
                   )
 
               if "// [FOSS_REMOVE_END]" not in text:
                   raise SystemExit(
-                      f"ERROR: Missing FOSS_REMOVE_END in {path}"
+                      f"ERROR: Missing FOSS_REMOVE_END: {path}"
                   )
 
               text = text.replace(
@@ -255,16 +262,16 @@ jobs:
 
               path.write_text(text)
 
-          provider = Path(
+          purchase_provider = Path(
               "app/lib/provider/purchase_provider.dart"
           )
 
-          if not provider.exists():
+          if not purchase_provider.exists():
               raise SystemExit(
                   "ERROR: purchase_provider.dart not found."
               )
 
-          provider.unlink()
+          purchase_provider.unlink()
 
           donation_page = Path(
               "app/lib/pages/donation/donation_page.dart"
@@ -281,10 +288,12 @@ jobs:
 
           if "in_app_purchase:" in pubspec.read_text():
               raise SystemExit(
-                  "ERROR: in_app_purchase remains in pubspec."
+                  "ERROR: in_app_purchase remains in pubspec.yaml."
               )
 
-          print("StoreKit / in-app purchase removed.")
+          print(
+              "StoreKit / in-app purchase removed."
+          )
           PY
 
           rm -f \
@@ -355,7 +364,11 @@ jobs:
 
 
       # ============================================================
-      # Lower Flutter plugin podspec declarations to 10.13
+      # Lower CocoaPods-backed Flutter plugin podspec declarations
+      # to 10.13.
+      #
+      # This bypasses resolver declarations only.
+      # Actual API compatibility is handled separately.
       # ============================================================
 
       - name: Backport macOS Flutter plugin podspecs
@@ -402,7 +415,10 @@ jobs:
               if not name or not raw_path:
                   continue
 
-              if not plugin.get("native_build", True):
+              if not plugin.get(
+                  "native_build",
+                  True,
+              ):
                   continue
 
               platform_dir = (
@@ -471,7 +487,9 @@ jobs:
                           backup,
                       )
 
-                  podspec.write_text(text)
+                  podspec.write_text(
+                      text
+                  )
 
                   status = "patched"
               else:
@@ -501,7 +519,7 @@ jobs:
 
 
       # ============================================================
-      # gal 2.3.3 High Sierra shim
+      # gal High Sierra shim
       # ============================================================
 
       - name: Backport gal for High Sierra
@@ -520,7 +538,8 @@ jobs:
           )"
 
           if [ -z "$GAL_SWIFT" ]; then
-            echo "ERROR: GalPlugin.swift not found."
+            echo "ERROR:"
+            echo "GalPlugin.swift not found."
             exit 1
           fi
 
@@ -578,14 +597,20 @@ jobs:
 
               case "open":
 
-                if let url = URL(string: "photos://") {
-                  _ = NSWorkspace.shared.open(url)
+                if let url = URL(
+                  string: "photos://"
+                ) {
+                  _ = NSWorkspace.shared.open(
+                    url
+                  )
                 }
 
                 result(nil)
 
               default:
-                result(FlutterMethodNotImplemented)
+                result(
+                  FlutterMethodNotImplemented
+                )
               }
             }
           }
@@ -595,7 +620,9 @@ jobs:
             '^[[:space:]]*import[[:space:]]+Photos([[:space:]]|$)' \
             "$GAL_SWIFT"; then
 
-            echo "ERROR: PhotoKit import remains in GalPlugin.swift."
+            echo "ERROR:"
+            echo "Photos import remains in GalPlugin.swift."
+
             exit 1
           fi
 
@@ -605,19 +632,12 @@ jobs:
       # ============================================================
       # connectivity_plus 7.3.1
       #
-      # Upstream provider:
+      # Replace Network.framework / NWPathMonitor with:
       #
-      #   import Network
-      #   NWPathMonitor
-      #
-      # Network.framework requires Mojave.
-      #
-      # Replacement:
-      #
-      #   SystemConfiguration
-      #   CoreWLAN
-      #   getifaddrs
-      #   DispatchSourceTimer
+      # - SystemConfiguration
+      # - CoreWLAN
+      # - getifaddrs
+      # - DispatchSourceTimer
       # ============================================================
 
       - name: Backport connectivity_plus for High Sierra
@@ -652,10 +672,8 @@ jobs:
           )"
 
           if [ -z "$CONNECTIVITY_ROOT" ]; then
-
             echo "ERROR:"
-            echo "connectivity_plus missing from macOS plugin graph."
-
+            echo "connectivity_plus missing from plugin graph."
             exit 1
           fi
 
@@ -665,26 +683,8 @@ jobs:
 
           CONNECTIVITY_PODSPEC="$CONNECTIVITY_ROOT/macos/connectivity_plus.podspec"
 
-
-          echo "============================================================"
-          echo "connectivity_plus"
-          echo "============================================================"
-
-          echo "Root:"
-          echo "$CONNECTIVITY_ROOT"
-
-          echo
-          echo "Provider:"
-          echo "$CONNECTIVITY_PROVIDER"
-
-          echo
-          echo "Podspec:"
-          echo "$CONNECTIVITY_PODSPEC"
-
-
           test -f "$CONNECTIVITY_PROVIDER"
           test -f "$CONNECTIVITY_PODSPEC"
-
 
           cp \
             "$CONNECTIVITY_PROVIDER" \
@@ -694,31 +694,21 @@ jobs:
             "$CONNECTIVITY_PODSPEC" \
             "${CONNECTIVITY_PODSPEC}.high-sierra-specific-original"
 
-
-          # --------------------------------------------------------
-          # High Sierra connectivity provider
-          # --------------------------------------------------------
-
           cat > "$CONNECTIVITY_PROVIDER" <<'SWIFT'
           import Foundation
           import SystemConfiguration
           import CoreWLAN
           import Darwin
 
-          /// High Sierra implementation for connectivity_plus.
-          ///
-          /// The upstream macOS implementation uses Apple's newer
-          /// Network framework. This replacement keeps the existing
-          /// ConnectivityProvider API while using APIs available on
-          /// macOS 10.13.
           public class PathMonitorConnectivityProvider:
             NSObject,
             ConnectivityProvider
           {
-            private let queue = DispatchQueue(
-              label:
-                "dev.fluttercommunity.plus.connectivity.high-sierra"
-            )
+            private let queue =
+              DispatchQueue(
+                label:
+                  "dev.fluttercommunity.plus.connectivity.high-sierra"
+              )
 
             private var timer:
               DispatchSourceTimer?
@@ -734,7 +724,8 @@ jobs:
               super.init()
 
               lastSignature = signature(
-                for: detectConnectivityTypes()
+                for:
+                  detectConnectivityTypes()
               )
             }
 
@@ -764,7 +755,8 @@ jobs:
               source.schedule(
                 deadline: .now(),
                 repeating: .seconds(2),
-                leeway: .milliseconds(250)
+                leeway:
+                  .milliseconds(250)
               )
 
               source.setEventHandler {
@@ -825,25 +817,22 @@ jobs:
                 return [.none]
               }
 
-              let activeInterfaces =
+              let active =
                 activeInterfaceNames()
 
-              if activeInterfaces.isEmpty {
+              if active.isEmpty {
                 return [.other]
               }
 
-              let wifiInterfaces =
+              let wifi =
                 wifiInterfaceNames()
 
               var result:
                 [ConnectivityType] = []
 
-
-              if activeInterfaces.contains(
+              if active.contains(
                 where: {
-                  wifiInterfaces.contains(
-                    $0
-                  )
+                  wifi.contains($0)
                 }
               ) {
                 result.append(
@@ -851,19 +840,16 @@ jobs:
                 )
               }
 
-
               let hasEthernet =
-                activeInterfaces.contains {
+                active.contains {
                   interfaceName in
 
-                  interfaceName.hasPrefix(
-                    "en"
-                  )
-                    && !wifiInterfaces.contains(
+                  interfaceName
+                    .hasPrefix("en")
+                    && !wifi.contains(
                       interfaceName
                     )
                 }
-
 
               if hasEthernet {
                 result.append(
@@ -871,13 +857,11 @@ jobs:
                 )
               }
 
-
               if result.isEmpty {
                 result.append(
                   .other
                 )
               }
-
 
               return result
             }
@@ -901,7 +885,6 @@ jobs:
                   AF_INET
                 )
 
-
               let reachability:
                 SCNetworkReachability? =
                 withUnsafePointer(
@@ -913,15 +896,14 @@ jobs:
                     to: sockaddr.self,
                     capacity: 1
                   ) {
-                    sockaddrPointer in
+                    address in
 
                     SCNetworkReachabilityCreateWithAddress(
                       nil,
-                      sockaddrPointer
+                      address
                     )
                   }
                 }
-
 
               guard let target =
                 reachability
@@ -929,47 +911,37 @@ jobs:
                 return false
               }
 
-
               var flags =
                 SCNetworkReachabilityFlags()
 
-
-              guard SCNetworkReachabilityGetFlags(
-                target,
-                &flags
-              )
+              guard
+                SCNetworkReachabilityGetFlags(
+                  target,
+                  &flags
+                )
               else {
                 return false
               }
 
-
-              let reachable =
-                flags.contains(
-                  .reachable
-                )
-
-
-              if !reachable {
+              if !flags.contains(
+                .reachable
+              ) {
                 return false
               }
 
+              if flags.contains(
+                .connectionRequired
+              ) {
+                return false
+              }
 
-              let connectionRequired =
-                flags.contains(
-                  .connectionRequired
-                )
+              if flags.contains(
+                .interventionRequired
+              ) {
+                return false
+              }
 
-
-              let interventionRequired =
-                flags.contains(
-                  .interventionRequired
-                )
-
-
-              return (
-                !connectionRequired
-                && !interventionRequired
-              )
+              return true
             }
 
 
@@ -977,8 +949,9 @@ jobs:
               -> Set<String>
             {
               var firstAddress:
-                UnsafeMutablePointer<ifaddrs>?
-
+                UnsafeMutablePointer<
+                  ifaddrs
+                >?
 
               guard (
                 getifaddrs(
@@ -991,29 +964,26 @@ jobs:
                 return []
               }
 
-
               defer {
                 freeifaddrs(
                   first
                 )
               }
 
-
               var result =
                 Set<String>()
 
-
               var pointer:
-                UnsafeMutablePointer<ifaddrs>? =
+                UnsafeMutablePointer<
+                  ifaddrs
+                >? =
                 first
-
 
               while let current =
                 pointer
               {
                 let interface =
                   current.pointee
-
 
                 if let address =
                   interface.ifa_addr
@@ -1025,10 +995,8 @@ jobs:
                         .sa_family
                     )
 
-
                   let flags =
                     interface.ifa_flags
-
 
                   let isUp =
                     (
@@ -1038,7 +1006,6 @@ jobs:
                       )
                     ) != 0
 
-
                   let isRunning =
                     (
                       flags
@@ -1047,7 +1014,6 @@ jobs:
                       )
                     ) != 0
 
-
                   let isLoopback =
                     (
                       flags
@@ -1055,7 +1021,6 @@ jobs:
                         IFF_LOOPBACK
                       )
                     ) != 0
-
 
                   if (
                     family == AF_INET
@@ -1068,9 +1033,9 @@ jobs:
                     let name =
                       String(
                         cString:
-                          interface.ifa_name
+                          interface
+                            .ifa_name
                       )
-
 
                     if (
                       !name.hasPrefix(
@@ -1087,11 +1052,9 @@ jobs:
                   }
                 }
 
-
                 pointer =
                   interface.ifa_next
               }
-
 
               return result
             }
@@ -1103,13 +1066,11 @@ jobs:
               let client =
                 CWWiFiClient.shared()
 
-
               guard let interfaces =
                 client.interfaces()
               else {
                 return []
               }
-
 
               return Set(
                 interfaces.compactMap {
@@ -1160,10 +1121,6 @@ jobs:
           SWIFT
 
 
-          # --------------------------------------------------------
-          # Link High Sierra frameworks
-          # --------------------------------------------------------
-
           python3 - "$CONNECTIVITY_PODSPEC" <<'PY'
           import sys
           from pathlib import Path
@@ -1171,14 +1128,11 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          required = [
-              "SystemConfiguration",
-              "CoreWLAN",
-          ]
-
-          if not all(
-              framework in text
-              for framework in required
+          if (
+              "SystemConfiguration"
+              not in text
+              or "CoreWLAN"
+              not in text
           ):
               framework_line = (
                   "  s.frameworks = "
@@ -1218,51 +1172,18 @@ jobs:
           PY
 
 
-          echo
-          echo "============================================================"
-          echo "Patched connectivity provider"
-          echo "============================================================"
-
-          cat "$CONNECTIVITY_PROVIDER"
-
-
-          echo
-          echo "============================================================"
-          echo "Patched connectivity_plus podspec"
-          echo "============================================================"
-
-          cat "$CONNECTIVITY_PODSPEC"
-
-
-          # --------------------------------------------------------
-          # IMPORTANT:
-          #
-          # Validate actual Swift code, not comments.
-          #
-          # Previous workflow incorrectly grepped the raw file and
-          # matched a documentation comment containing the word
-          # "NWPathMonitor".
-          # --------------------------------------------------------
-
-          echo
-          echo "============================================================"
-          echo "Validate Network.framework is gone"
-          echo "============================================================"
+          # Validate actual executable Swift code,
+          # not comments containing words such as NWPathMonitor.
 
           python3 - "$CONNECTIVITY_PROVIDER" <<'PY'
           import re
           import sys
           from pathlib import Path
 
-
-          path = Path(
+          source = Path(
               sys.argv[1]
-          )
+          ).read_text()
 
-          source = path.read_text()
-
-
-          # Remove /* ... */ block comments.
           code = re.sub(
               r"/\*.*?\*/",
               "",
@@ -1270,97 +1191,69 @@ jobs:
               flags=re.DOTALL,
           )
 
-
-          # Remove // and /// comments.
           code = re.sub(
               r"//[^\n]*",
               "",
               code,
           )
 
-
           forbidden = {
               "import Network":
                   r"(?m)^\s*import\s+Network\s*$",
-
               "NWPathMonitor":
                   r"\bNWPathMonitor\b",
-
               "NWPath":
                   r"\bNWPath\b",
-
               "NWInterface":
                   r"\bNWInterface\b",
           }
 
-
-          errors = []
-
+          found = []
 
           for name, pattern in forbidden.items():
-
-              match = re.search(
+              if re.search(
                   pattern,
                   code,
-              )
+              ):
+                  found.append(name)
 
-              if match:
-                  errors.append(
-                      name
-                  )
-
-
-          if errors:
-
+          if found:
               print(
-                  "ERROR: Network.framework code "
-                  "still remains:"
+                  "ERROR: Network.framework "
+                  "code remains:"
               )
 
-              for item in errors:
+              for item in found:
                   print(
                       f"  {item}"
                   )
 
-              raise SystemExit(
-                  1
-              )
-
+              raise SystemExit(1)
 
           required = {
               "SystemConfiguration":
                   r"(?m)^\s*import\s+SystemConfiguration\s*$",
-
               "CoreWLAN":
                   r"(?m)^\s*import\s+CoreWLAN\s*$",
-
               "SCNetworkReachability":
                   r"\bSCNetworkReachability\b",
-
               "getifaddrs":
                   r"\bgetifaddrs\b",
           }
 
-
           missing = []
 
-
           for name, pattern in required.items():
-
               if not re.search(
                   pattern,
                   code,
               ):
-                  missing.append(
-                      name
-                  )
-
+                  missing.append(name)
 
           if missing:
-
               print(
                   "ERROR: High Sierra connectivity "
-                  "implementation is incomplete:"
+                  "provider is incomplete:"
               )
 
               for item in missing:
@@ -1368,47 +1261,13 @@ jobs:
                       f"  missing {item}"
                   )
 
-              raise SystemExit(
-                  1
-              )
-
+              raise SystemExit(1)
 
           print(
-              "PASS: No executable Network.framework "
-              "references remain."
-          )
-
-          print(
-              "PASS: SystemConfiguration/CoreWLAN "
-              "implementation is present."
+              "connectivity_plus High Sierra "
+              "source validation passed."
           )
           PY
-
-
-          if ! grep -q \
-            'SystemConfiguration' \
-            "$CONNECTIVITY_PODSPEC"; then
-
-            echo "ERROR:"
-            echo "SystemConfiguration is not linked."
-
-            exit 1
-          fi
-
-
-          if ! grep -q \
-            'CoreWLAN' \
-            "$CONNECTIVITY_PODSPEC"; then
-
-            echo "ERROR:"
-            echo "CoreWLAN is not linked."
-
-            exit 1
-          fi
-
-
-          echo
-          echo "connectivity_plus High Sierra provider installed."
 
 
       # ============================================================
@@ -1456,10 +1315,8 @@ jobs:
                   f"  {package['name']} "
                   f"{package['version']}"
               )
-
               print(
-                  f"    "
-                  f"{package['manifest_path']}"
+                  f"    {package['manifest_path']}"
               )
           PY
 
@@ -1492,7 +1349,6 @@ jobs:
 
           text = path.read_text()
 
-
           text, count = re.subn(
               r'MACOSX_DEPLOYMENT_TARGET'
               r'\s*=\s*'
@@ -1504,15 +1360,14 @@ jobs:
 
           if count == 0:
               raise SystemExit(
-                  "ERROR: No deployment targets found in pbxproj."
+                  "ERROR: No deployment targets "
+                  "found in pbxproj."
               )
-
 
           if (
               "LOCALSEND_LEGACY_MACOS_TARGET = 10.13;"
               not in text
           ):
-
               replacement = (
                   "buildSettings = {\n"
                   "\t\t\t\t"
@@ -1529,7 +1384,6 @@ jobs:
                   "buildSettings = {\n",
                   replacement,
               )
-
 
           text = re.sub(
               r'DEVELOPMENT_TEAM'
@@ -1590,6 +1444,8 @@ jobs:
           )
 
 
+          # DockProgress -> 3.2.0
+
           dock_pattern = re.compile(
               r'('
               r'[0-9A-F]+'
@@ -1622,7 +1478,8 @@ jobs:
 
           if not match:
               raise SystemExit(
-                  "ERROR: DockProgress package block not found."
+                  "ERROR: DockProgress package "
+                  "block not found."
               )
 
           replacement = (
@@ -1652,12 +1509,17 @@ jobs:
               re.DOTALL,
           )
 
-          if not check.search(text):
+          if not check.search(
+              text
+          ):
               raise SystemExit(
-                  "ERROR: DockProgress 3.2.0 patch failed."
+                  "ERROR: DockProgress 3.2.0 "
+                  "patch failed."
               )
 
-          path.write_text(text)
+          path.write_text(
+              text
+          )
           PY
 
 
@@ -1699,7 +1561,6 @@ jobs:
 
           text = path.read_text()
 
-
           text, count = re.subn(
               r"^platform"
               r"\s+:osx,"
@@ -1716,7 +1577,6 @@ jobs:
                   "ERROR: Podfile platform patch failed."
               )
 
-
           text, count = re.subn(
               r"config\.build_settings"
               r"\[['\"]"
@@ -1732,9 +1592,9 @@ jobs:
 
           if count == 0:
               raise SystemExit(
-                  "ERROR: Pod deployment target patch failed."
+                  "ERROR: Pod deployment target "
+                  "patch failed."
               )
-
 
           needle = (
               "config.build_settings"
@@ -1747,7 +1607,6 @@ jobs:
               "['ARCHS'] = 'x86_64'"
               not in text
           ):
-
               replacement = (
                   needle
                   + "\n"
@@ -1770,9 +1629,7 @@ jobs:
                   1,
               )
 
-
           if "target 'ShareExtension' do" not in text:
-
               share_target = """
           target 'ShareExtension' do
             use_frameworks!
@@ -1793,10 +1650,13 @@ jobs:
 
           if "target 'ShareExtension' do" not in text:
               raise SystemExit(
-                  "ERROR: ShareExtension CocoaPods target missing."
+                  "ERROR: ShareExtension "
+                  "CocoaPods target missing."
               )
 
-          path.write_text(text)
+          path.write_text(
+              text
+          )
           PY
 
 
@@ -1818,7 +1678,9 @@ jobs:
               "private func handleFlutterCall",
           )
 
-          path.write_text(text)
+          path.write_text(
+              text
+          )
           PY
 
 
@@ -1842,6 +1704,681 @@ jobs:
             'XCRemoteSwiftPackageReference "DockProgress"' \
             "$PBX" \
             || true
+
+
+      # ============================================================
+      # ShareExtension High Sierra backport
+      #
+      # Remove:
+      #
+      # - SwiftUI
+      # - UniformTypeIdentifiers / UTType
+      # - Task
+      # - async / await
+      # - withCheckedThrowingContinuation
+      # - NSWorkspace.OpenConfiguration
+      #
+      # Replace with:
+      #
+      # - AppKit
+      # - legacy UTI string "public.url"
+      # - NSItemProvider callback API
+      # - DispatchGroup
+      # - NSWorkspace.open(URL)
+      # ============================================================
+
+      - name: Backport ShareExtension for High Sierra
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          UTILITIES="app/macos/ShareExtension/Utilities.swift"
+          SHARE_CONTROLLER="app/macos/ShareExtension/ShareController.swift"
+
+          test -f "$UTILITIES"
+          test -f "$SHARE_CONTROLLER"
+
+
+          cp \
+            "$UTILITIES" \
+            "${UTILITIES}.high-sierra-original"
+
+          cp \
+            "$SHARE_CONTROLLER" \
+            "${SHARE_CONTROLLER}.high-sierra-original"
+
+
+          # --------------------------------------------------------
+          # Utilities.swift
+          # --------------------------------------------------------
+
+          cat > "$UTILITIES" <<'SWIFT'
+          import AppKit
+          import Foundation
+
+          extension Sequence where Element: Sequence {
+            func flatten() -> [Element.Element] {
+              return flatMap { $0 }
+            }
+          }
+
+
+          struct TextContent {
+            var title: String?
+            var body: String?
+          }
+
+
+          extension NSExtensionContext {
+
+            var inputItemsTyped:
+              [NSExtensionItem]
+            {
+              return inputItems
+                as? [NSExtensionItem]
+                ?? []
+            }
+
+
+            var attachments:
+              [NSItemProvider]
+            {
+              return inputItemsTyped
+                .compactMap {
+                  $0.attachments
+                }
+                .flatten()
+            }
+
+
+            var textContent:
+              TextContent
+            {
+              return TextContent(
+                title:
+                  inputItemsTyped
+                    .first?
+                    .attributedTitle?
+                    .string,
+                body:
+                  inputItemsTyped
+                    .first?
+                    .attributedContentText?
+                    .string
+              )
+            }
+          }
+
+
+          extension NSError {
+
+            static let userCancelled =
+              NSError(
+                domain:
+                  NSCocoaErrorDomain,
+                code:
+                  NSUserCancelledError,
+                userInfo:
+                  nil
+              )
+          }
+
+
+          typealias ExtensionRunCompletion =
+            (
+              [NSExtensionItem],
+              Error?
+            ) -> Void
+
+
+          class ExtensionController:
+            NSViewController
+          {
+            override func loadView() {
+              view = NSView(
+                frame: .zero
+              )
+
+              guard let context =
+                extensionContext
+              else {
+                return
+              }
+
+              run(
+                context
+              ) {
+                items,
+                error in
+
+                DispatchQueue.main.async {
+
+                  if let error =
+                    error
+                  {
+                    context.cancelRequest(
+                      withError:
+                        error
+                    )
+
+                    return
+                  }
+
+                  context.completeRequest(
+                    returningItems:
+                      items,
+                    completionHandler:
+                      nil
+                  )
+                }
+              }
+            }
+
+
+            func run(
+              _ context:
+                NSExtensionContext,
+              completion:
+                @escaping
+                ExtensionRunCompletion
+            ) {
+              completion(
+                [],
+                nil
+              )
+            }
+          }
+
+
+          private func isAppRunning(
+            at url:
+              URL
+          ) -> Bool
+          {
+            return NSWorkspace
+              .shared
+              .runningApplications
+              .contains {
+                application in
+
+                application.bundleURL
+                  == url
+              }
+          }
+
+
+          func launchAppIfNeeded(
+            appURL:
+              URL
+          ) {
+            guard !isAppRunning(
+              at: appURL
+            )
+            else {
+              return
+            }
+
+            let success =
+              NSWorkspace
+                .shared
+                .open(
+                  appURL
+                )
+
+            if success {
+              print(
+                "Containing application "
+                + "launch requested successfully"
+              )
+            } else {
+              print(
+                "Failed to request containing "
+                + "application launch"
+              )
+            }
+          }
+
+
+          func getParentAppURL()
+            -> URL
+          {
+            return Bundle
+              .main
+              .bundleURL
+              .deletingLastPathComponent()
+              .deletingLastPathComponent()
+              .deletingLastPathComponent()
+          }
+          SWIFT
+
+
+          # --------------------------------------------------------
+          # ShareController.swift
+          # --------------------------------------------------------
+
+          cat > "$SHARE_CONTROLLER" <<'SWIFT'
+          import Foundation
+          import Defaults
+
+          final class ShareController:
+            ExtensionController
+          {
+            private let urlTypeIdentifier =
+              "public.url"
+
+
+            override func run(
+              _ context:
+                NSExtensionContext,
+              completion:
+                @escaping
+                ExtensionRunCompletion
+            ) {
+              let providers =
+                context.attachments
+
+              let group =
+                DispatchGroup()
+
+              let lock =
+                NSLock()
+
+              var urls:
+                [URL] = []
+
+              var sharedString:
+                String?
+
+
+              for provider in providers {
+
+                guard
+                  provider
+                    .hasItemConformingToTypeIdentifier(
+                      urlTypeIdentifier
+                    )
+                else {
+                  print(
+                    "This attachment type "
+                    + "is not supported yet"
+                  )
+
+                  continue
+                }
+
+
+                group.enter()
+
+
+                provider.loadItem(
+                  forTypeIdentifier:
+                    urlTypeIdentifier,
+                  options:
+                    nil
+                ) {
+                  item,
+                  error in
+
+                  defer {
+                    group.leave()
+                  }
+
+
+                  if let error =
+                    error
+                  {
+                    print(
+                      "Failed to load URL: "
+                      + error.localizedDescription
+                    )
+
+                    return
+                  }
+
+
+                  guard let url =
+                    self.url(
+                      from: item
+                    )
+                  else {
+                    print(
+                      "Failed to convert "
+                      + "shared item to URL"
+                    )
+
+                    return
+                  }
+
+
+                  lock.lock()
+
+                  if url.isFileURL {
+                    urls.append(
+                      url
+                    )
+                  } else {
+                    sharedString =
+                      url.absoluteString
+                  }
+
+                  lock.unlock()
+                }
+              }
+
+
+              group.notify(
+                queue: .main
+              ) {
+                lock.lock()
+
+                let collectedURLs =
+                  urls
+
+                var collectedString =
+                  sharedString
+
+                lock.unlock()
+
+
+                if let body =
+                  context
+                    .textContent
+                    .body
+                {
+                  collectedString =
+                    body
+                }
+
+
+                if (
+                  collectedURLs.isEmpty
+                  && collectedString == nil
+                ) {
+                  completion(
+                    [],
+                    NSError.userCancelled
+                  )
+
+                  return
+                }
+
+
+                let bookmarks:
+                  [Data] =
+                  collectedURLs
+                    .compactMap {
+                      url in
+
+                      createBookmarkForFile(
+                        at: url
+                      )
+                    }
+
+
+                Defaults[
+                  .pendingFiles
+                ].append(
+                  contentsOf:
+                    bookmarks
+                )
+
+
+                if let string =
+                  collectedString
+                {
+                  Defaults[
+                    .pendingStrings
+                  ].append(
+                    string
+                  )
+                }
+
+
+                let appURL =
+                  getParentAppURL()
+
+
+                launchAppIfNeeded(
+                  appURL:
+                    appURL
+                )
+
+
+                completion(
+                  [],
+                  nil
+                )
+              }
+            }
+
+
+            private func url(
+              from item:
+                Any?
+            ) -> URL?
+            {
+              if let value =
+                item as? URL
+              {
+                return value
+              }
+
+
+              if let value =
+                item as? NSURL
+              {
+                return value as URL
+              }
+
+
+              if let value =
+                item as? String
+              {
+                if let parsed =
+                  URL(
+                    string:
+                      value
+                  ),
+                  parsed.scheme != nil
+                {
+                  return parsed
+                }
+
+                return URL(
+                  fileURLWithPath:
+                    value
+                )
+              }
+
+
+              if let value =
+                item as? NSString
+              {
+                let string =
+                  value as String
+
+                if let parsed =
+                  URL(
+                    string:
+                      string
+                  ),
+                  parsed.scheme != nil
+                {
+                  return parsed
+                }
+
+                return URL(
+                  fileURLWithPath:
+                    string
+                )
+              }
+
+
+              return nil
+            }
+          }
+          SWIFT
+
+
+          echo "============================================================"
+          echo "Utilities.swift after High Sierra patch"
+          echo "============================================================"
+
+          cat "$UTILITIES"
+
+
+          echo
+          echo "============================================================"
+          echo "ShareController.swift after High Sierra patch"
+          echo "============================================================"
+
+          cat "$SHARE_CONTROLLER"
+
+
+          # --------------------------------------------------------
+          # Validate executable code after removing comments.
+          # --------------------------------------------------------
+
+          python3 - \
+            "$UTILITIES" \
+            "$SHARE_CONTROLLER" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+
+          def uncommented(path):
+              source = Path(
+                  path
+              ).read_text()
+
+              source = re.sub(
+                  r"/\*.*?\*/",
+                  "",
+                  source,
+                  flags=re.DOTALL,
+              )
+
+              source = re.sub(
+                  r"//[^\n]*",
+                  "",
+                  source,
+              )
+
+              return source
+
+
+          code = "\n".join(
+              uncommented(path)
+              for path in sys.argv[1:]
+          )
+
+
+          forbidden = {
+              "SwiftUI":
+                  r"(?m)^\s*import\s+SwiftUI\s*$",
+
+              "UniformTypeIdentifiers":
+                  r"(?m)^\s*import\s+UniformTypeIdentifiers\s*$",
+
+              "UTType":
+                  r"\bUTType\b",
+
+              "Task":
+                  r"\bTask\b",
+
+              "async":
+                  r"\basync\b",
+
+              "await":
+                  r"\bawait\b",
+
+              "withCheckedThrowingContinuation":
+                  r"\bwithCheckedThrowingContinuation\b",
+
+              "NSWorkspace.OpenConfiguration":
+                  r"\bNSWorkspace\.OpenConfiguration\b",
+          }
+
+
+          errors = []
+
+
+          for name, pattern in forbidden.items():
+              if re.search(
+                  pattern,
+                  code,
+              ):
+                  errors.append(
+                      name
+                  )
+
+
+          if errors:
+              print(
+                  "ERROR: Modern API remains "
+                  "in ShareExtension:"
+              )
+
+              for name in errors:
+                  print(
+                      f"  {name}"
+                  )
+
+              raise SystemExit(
+                  1
+              )
+
+
+          required = {
+              "AppKit":
+                  r"(?m)^\s*import\s+AppKit\s*$",
+
+              "legacy UTI":
+                  r'"public\.url"',
+
+              "legacy NSItemProvider callback":
+                  r"\.loadItem\s*\(",
+
+              "NSWorkspace.open":
+                  r"\.open\s*\(",
+          }
+
+
+          missing = []
+
+
+          for name, pattern in required.items():
+              if not re.search(
+                  pattern,
+                  code,
+              ):
+                  missing.append(
+                      name
+                  )
+
+
+          if missing:
+              print(
+                  "ERROR: ShareExtension "
+                  "compatibility patch incomplete:"
+              )
+
+              for name in missing:
+                  print(
+                      f"  missing {name}"
+                  )
+
+              raise SystemExit(
+                  1
+              )
+
+
+          print(
+              "ShareExtension High Sierra "
+              "source validation passed."
+          )
+          PY
 
 
       # ============================================================
@@ -1886,7 +2423,8 @@ jobs:
             "$PODFILE"; then
 
             echo "ERROR:"
-            echo "Literal Podfile target would trigger Flutter migration."
+            echo "Literal Podfile target would "
+            echo "trigger Flutter migration."
 
             exit 1
           fi
@@ -1925,10 +2463,12 @@ jobs:
           fi
 
 
-          ruby -c "$PODFILE"
+          ruby -c \
+            "$PODFILE"
+
 
           echo
-          echo "Static validation passed."
+          echo "Static High Sierra validation passed."
 
 
       # ============================================================
@@ -1982,10 +2522,12 @@ jobs:
           echo "Podfile syntax"
           echo "============================================================"
 
-          ruby -c Podfile
+          ruby -c \
+            Podfile
 
 
           GENERATED_XCCONFIG="Flutter/ephemeral/Flutter-Generated.xcconfig"
+
 
           if [ ! -f "$GENERATED_XCCONFIG" ]; then
 
@@ -2013,8 +2555,11 @@ jobs:
             2>&1 | tee ../../pod-env.log
 
 
-          rm -rf Pods
-          rm -f Podfile.lock
+          rm -rf \
+            Pods
+
+          rm -f \
+            Podfile.lock
 
 
           echo
@@ -2038,9 +2583,7 @@ jobs:
           echo "Generated FlutterMacOS.podspec"
           echo "============================================================"
 
-
           FLUTTER_MACOS_PODSPEC="Flutter/ephemeral/FlutterMacOS.podspec"
-
 
           if [ -f "$FLUTTER_MACOS_PODSPEC" ]; then
             cat "$FLUTTER_MACOS_PODSPEC"
@@ -2081,7 +2624,8 @@ jobs:
             "$FLUTTER_MACOS_PODSPEC"; then
 
             echo "ERROR:"
-            echo "FlutterMacOS.podspec does not target 10.13."
+            echo "FlutterMacOS.podspec "
+            echo "does not target 10.13."
 
             exit 1
           fi
@@ -2120,7 +2664,8 @@ jobs:
 
           PODSPEC="macos/Flutter/ephemeral/FlutterMacOS.podspec"
 
-          test -f "$PODSPEC"
+          test -f \
+            "$PODSPEC"
 
 
           if ! grep -q \
@@ -2165,7 +2710,8 @@ jobs:
               "$REGISTRANT"; then
 
               echo "ERROR:"
-              echo "StoreKit remains in GeneratedPluginRegistrant."
+              echo "StoreKit remains in "
+              echo "GeneratedPluginRegistrant."
 
               cat "$REGISTRANT"
 
@@ -2179,7 +2725,7 @@ jobs:
 
 
       # ============================================================
-      # Flutter migration validation
+      # Verify migration bypass
       # ============================================================
 
       - name: Verify Flutter migration bypass
@@ -2337,7 +2883,8 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p ../diagnostics
+          mkdir -p \
+            ../diagnostics
 
 
           xcodebuild \
@@ -2418,29 +2965,24 @@ jobs:
 
               print()
               print(path)
-
               print(
                   "  deployment:",
                   deployments[:3],
               )
-
               print(
                   "  ARCHS:",
                   archs[:3],
               )
-
               print(
                   "  EXCLUDED_ARCHS:",
                   excluded[:3],
               )
-
 
               if not deployments:
                   raise SystemExit(
                       f"ERROR: {path}: "
                       "deployment target missing."
                   )
-
 
               if deployments[0] != "10.13":
                   raise SystemExit(
@@ -2449,18 +2991,15 @@ jobs:
                       f"{deployments[0]!r}"
                   )
 
-
               if not archs:
                   raise SystemExit(
                       f"ERROR: {path}: ARCHS missing."
                   )
 
-
               if "x86_64" not in archs[0].split():
                   raise SystemExit(
                       f"ERROR: {path}: x86_64 missing."
                   )
-
 
               if (
                   excluded
@@ -2471,7 +3010,6 @@ jobs:
                       f"ERROR: {path}: arm64 not excluded."
                   )
 
-
           print()
           print(
               "Effective build settings are correct."
@@ -2480,7 +3018,7 @@ jobs:
 
 
       # ============================================================
-      # Flutter Engine audit
+      # Flutter engine audit
       # ============================================================
 
       - name: Inspect FlutterMacOS engine
@@ -2490,7 +3028,8 @@ jobs:
 
           flutter precache --macos
 
-          mkdir -p diagnostics
+          mkdir -p \
+            diagnostics
 
           REPORT="diagnostics/flutter-engine-audit-prebuild.txt"
 
@@ -2607,6 +3146,7 @@ jobs:
           echo "StoreKit/IAP:       removed"
           echo "Plugin podspecs:    10.13"
           echo "connectivity_plus:  SystemConfiguration/CoreWLAN"
+          echo "ShareExtension:     High Sierra callback implementation"
           echo "============================================================"
 
 
@@ -2618,6 +3158,11 @@ jobs:
 
       # ============================================================
       # Compiler diagnostics
+      #
+      # IMPORTANT:
+      # Availability warnings are deliberately separated from real
+      # compiler/linker errors so photo_manager warnings do not bury
+      # the actual blocker again.
       # ============================================================
 
       - name: Extract compiler errors
@@ -2626,7 +3171,9 @@ jobs:
         run: |
           set +e
 
-          mkdir -p diagnostics
+          mkdir -p \
+            diagnostics
+
 
           if [ -f flutter-macos-build.log ]; then
 
@@ -2634,46 +3181,60 @@ jobs:
           from pathlib import Path
           import re
 
+
           source = Path(
               "flutter-macos-build.log"
-          )
-
-          output = Path(
-              "diagnostics/compiler-errors.txt"
           )
 
           lines = source.read_text(
               errors="replace"
           ).splitlines()
 
-          pattern = re.compile(
-              r"error:|"
-              r"fatal error:|"
-              r"is only available in macOS|"
-              r"introduced in macOS|"
-              r"requires macOS|"
-              r"building for macOS|"
-              r"\*\* BUILD FAILED \*\*|"
-              r"The following build commands failed"
+
+          # --------------------------------------------------------
+          # Real errors
+          # --------------------------------------------------------
+
+          primary_patterns = [
+              r"\berror:",
+              r"\bfatal error:",
+              r"Undefined symbols for architecture",
+              r"symbol\(s\) not found for architecture",
+              r"ld: ",
+              r"clang: error:",
+              r"Command .* failed with a nonzero exit code",
+              r"PhaseScriptExecution .* failed",
+              r"\*\* BUILD FAILED \*\*",
+              r"The following build commands failed:",
+          ]
+
+
+          primary = re.compile(
+              "|".join(
+                  primary_patterns
+              )
           )
 
-          hits = [
+
+          hit_indexes = [
               index
               for index, line in enumerate(lines)
-              if pattern.search(line)
+              if primary.search(line)
           ]
+
 
           ranges = []
 
-          for index in hits:
+
+          for index in hit_indexes:
               start = max(
                   0,
-                  index - 12,
+                  index - 16,
               )
 
               end = min(
                   len(lines),
-                  index + 16,
+                  index + 22,
               )
 
               if (
@@ -2692,34 +3253,131 @@ jobs:
                       (start, end)
                   )
 
-          output_lines = []
+
+          output = []
+
 
           for start, end in ranges:
-              output_lines.append(
-                  "=" * 80
+              output.append(
+                  "=" * 100
               )
 
               for index in range(
                   start,
                   end,
               ):
-                  output_lines.append(
+                  output.append(
                       f"{index + 1}: "
                       f"{lines[index]}"
                   )
 
-          output.write_text(
-              "\n".join(output_lines)
+
+          Path(
+              "diagnostics/compiler-errors.txt"
+          ).write_text(
+              "\n".join(output)
               + (
                   "\n"
-                  if output_lines
+                  if output
                   else ""
               )
           )
 
-          if output.exists():
+
+          # --------------------------------------------------------
+          # Availability warnings / notes separately
+          # --------------------------------------------------------
+
+          availability = []
+
+          availability_pattern = re.compile(
+              r"(?:"
+              r"warning:.*only available in macOS"
+              r"|"
+              r"note:.*introduced in macOS"
+              r"|"
+              r"marked as being introduced in macOS"
+              r")"
+          )
+
+
+          for index, line in enumerate(lines):
+              if availability_pattern.search(
+                  line
+              ):
+                  availability.append(
+                      f"{index + 1}: "
+                      f"{line}"
+                  )
+
+
+          Path(
+              "diagnostics/"
+              "availability-warnings.txt"
+          ).write_text(
+              "\n".join(
+                  availability
+              )
+              + (
+                  "\n"
+                  if availability
+                  else ""
+              )
+          )
+
+
+          # --------------------------------------------------------
+          # Always preserve the end of the complete build.
+          # --------------------------------------------------------
+
+          tail = lines[
+              max(
+                  0,
+                  len(lines) - 1200,
+              ):
+          ]
+
+
+          Path(
+              "diagnostics/build-tail.txt"
+          ).write_text(
+              "\n".join(
+                  tail
+              )
+              + "\n"
+          )
+
+
+          print(
+              "============================================================"
+          )
+          print(
+              "REAL COMPILER / LINKER ERRORS"
+          )
+          print(
+              "============================================================"
+          )
+
+
+          error_file = Path(
+              "diagnostics/compiler-errors.txt"
+          )
+
+
+          if (
+              error_file.exists()
+              and error_file.stat().st_size
+          ):
               print(
-                  output.read_text()
+                  error_file.read_text()
+              )
+          else:
+              print(
+                  "No explicit error line was found."
+              )
+
+              print(
+                  "See diagnostics/build-tail.txt."
               )
           PY
 
@@ -2727,7 +3385,7 @@ jobs:
 
 
       # ============================================================
-      # Locate built app
+      # Locate built application
       # ============================================================
 
       - name: Locate built application
@@ -2778,7 +3436,7 @@ jobs:
 
 
       # ============================================================
-      # Main binary architecture
+      # Main architecture
       # ============================================================
 
       - name: Verify x86_64 application
@@ -2825,7 +3483,7 @@ jobs:
 
 
       # ============================================================
-      # Audit built Mach-O binaries
+      # Audit every built Mach-O
       # ============================================================
 
       - name: Audit Mach-O deployment targets
@@ -2834,11 +3492,13 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p ../diagnostics
+          mkdir -p \
+            ../diagnostics
 
           REPORT="../diagnostics/macho-deployment-targets.txt"
 
           : > "$REPORT"
+
 
           find "$APP" \
             -type f \
@@ -2908,7 +3568,7 @@ jobs:
 
 
       # ============================================================
-      # Code signatures
+      # Signatures / entitlements
       # ============================================================
 
       - name: Inspect code signatures
@@ -2917,7 +3577,8 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p ../diagnostics
+          mkdir -p \
+            ../diagnostics
 
           REPORT="../diagnostics/codesign-report.txt"
 
@@ -2996,11 +3657,13 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p release
+          mkdir -p \
+            release
 
           OUTPUT="release/LocalSend-macOS-High-Sierra-10.13-x86_64.zip"
 
-          rm -f "$OUTPUT"
+          rm -f \
+            "$OUTPUT"
 
           ditto \
             -c \
@@ -3010,7 +3673,8 @@ jobs:
             "$APP" \
             "$OUTPUT"
 
-          ls -lh "$OUTPUT"
+          ls -lh \
+            "$OUTPUT"
 
 
       # ============================================================
@@ -3036,7 +3700,8 @@ jobs:
         run: |
           set +e
 
-          mkdir -p diagnostics
+          mkdir -p \
+            diagnostics
 
 
           cp \
@@ -3138,6 +3803,34 @@ jobs:
           cp \
             app/macos/Flutter/ephemeral/Flutter-Generated.xcconfig \
             diagnostics/Flutter-Generated.xcconfig \
+            2>/dev/null
+
+
+          # --------------------------------------------------------
+          # ShareExtension patched/original sources
+          # --------------------------------------------------------
+
+          cp \
+            app/macos/ShareExtension/Utilities.swift \
+            diagnostics/ShareExtension-Utilities.high-sierra.swift \
+            2>/dev/null
+
+
+          cp \
+            app/macos/ShareExtension/Utilities.swift.high-sierra-original \
+            diagnostics/ShareExtension-Utilities.original.swift \
+            2>/dev/null
+
+
+          cp \
+            app/macos/ShareExtension/ShareController.swift \
+            diagnostics/ShareController.high-sierra.swift \
+            2>/dev/null
+
+
+          cp \
+            app/macos/ShareExtension/ShareController.swift.high-sierra-original \
+            diagnostics/ShareController.original.swift \
             2>/dev/null
 
 
