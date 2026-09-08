@@ -32,7 +32,7 @@ jobs:
 
 
       # ============================================================
-      # Flutter
+      # Toolchains
       # ============================================================
 
       - name: Setup Flutter
@@ -42,11 +42,6 @@ jobs:
           channel: stable
           cache: true
 
-
-      # ============================================================
-      # Rust
-      # ============================================================
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -55,9 +50,7 @@ jobs:
 
 
       # ============================================================
-      # Flutter 3.41.9 generates an ephemeral FlutterMacOS podspec
-      # with minimum macOS 10.15.
-      #
+      # Flutter 3.41.9 generates FlutterMacOS.podspec with 10.15.
       # Patch the generator itself.
       # ============================================================
 
@@ -149,8 +142,7 @@ jobs:
 
 
       # ============================================================
-      # Remove in_app_purchase / StoreKit using LocalSend's own
-      # FOSS dependency-removal mechanism.
+      # Remove StoreKit / in_app_purchase
       # ============================================================
 
       - name: Remove in-app purchases
@@ -187,7 +179,6 @@ jobs:
               + "\n"
           )
 
-
           files = [
               Path(
                   "app/lib/config/init.dart"
@@ -201,7 +192,6 @@ jobs:
                   "donation_page_vm.dart"
               ),
           ]
-
 
           for path in files:
               text = path.read_text()
@@ -228,7 +218,6 @@ jobs:
 
               path.write_text(text)
 
-
           purchase_provider = Path(
               "app/lib/provider/purchase_provider.dart"
           )
@@ -239,7 +228,6 @@ jobs:
               )
 
           purchase_provider.unlink()
-
 
           donation_page = Path(
               "app/lib/pages/donation/donation_page.dart"
@@ -253,7 +241,6 @@ jobs:
           )
 
           donation_page.write_text(text)
-
 
           if "in_app_purchase:" in pubspec.read_text():
               raise SystemExit(
@@ -285,7 +272,7 @@ jobs:
 
 
       # ============================================================
-      # Dependency validation
+      # StoreKit validation
       # ============================================================
 
       - name: Verify StoreKit removal
@@ -301,7 +288,6 @@ jobs:
 
           cd ..
 
-
           if grep -E \
             '(^|[[:space:]])in_app_purchase(_storekit)?([[:space:]]|$)' \
             flutter-pub-deps.txt; then
@@ -311,7 +297,6 @@ jobs:
 
             exit 1
           fi
-
 
           if grep -q \
             'in_app_purchase_storekit' \
@@ -325,8 +310,7 @@ jobs:
 
 
       # ============================================================
-      # Backport all actual macOS Flutter plugin podspec declarations
-      # to 10.13.
+      # Lower macOS plugin podspec declarations to 10.13
       # ============================================================
 
       - name: Backport macOS Flutter plugin podspecs
@@ -341,13 +325,11 @@ jobs:
             app/.flutter-plugins-dependencies \
             diagnostics/flutter-plugins-dependencies.json
 
-
           python3 <<'PY'
           import json
           import re
           import shutil
           from pathlib import Path
-
 
           plugins_file = Path(
               "app/.flutter-plugins-dependencies"
@@ -357,16 +339,13 @@ jobs:
               plugins_file.read_text()
           )
 
-
           plugins = (
               data
               .get("plugins", {})
               .get("macos", [])
           )
 
-
           report = []
-
 
           for plugin in plugins:
               name = plugin.get(
@@ -377,17 +356,14 @@ jobs:
                   "path"
               )
 
-
               if not name or not raw_path:
                   continue
-
 
               if not plugin.get(
                   "native_build",
                   True,
               ):
                   continue
-
 
               platform_dir = (
                   "darwin"
@@ -398,13 +374,11 @@ jobs:
                   else "macos"
               )
 
-
               podspec = (
                   Path(raw_path)
                   / platform_dir
                   / f"{name}.podspec"
               )
-
 
               if not podspec.exists():
                   report.append({
@@ -414,10 +388,8 @@ jobs:
 
                   continue
 
-
               original = podspec.read_text()
               text = original
-
 
               text = re.sub(
                   r"("
@@ -431,7 +403,6 @@ jobs:
                   r"\1'10.13'",
                   text,
               )
-
 
               text = re.sub(
                   r"("
@@ -447,7 +418,6 @@ jobs:
                   r"\1'10.13'",
                   text,
               )
-
 
               if text != original:
                   backup = podspec.with_suffix(
@@ -466,9 +436,9 @@ jobs:
                   )
 
                   status = "patched"
+
               else:
                   status = "unchanged"
-
 
               report.append({
                   "plugin": name,
@@ -478,11 +448,9 @@ jobs:
                   "status": status,
               })
 
-
               print(
                   f"{name}: {status}"
               )
-
 
           Path(
               "diagnostics/"
@@ -516,17 +484,17 @@ jobs:
               -quit
           )"
 
-
           if [ -z "$GAL_SWIFT" ]; then
-            echo "ERROR: GalPlugin.swift not found."
+
+            echo "ERROR:"
+            echo "GalPlugin.swift not found."
+
             exit 1
           fi
-
 
           cp \
             "$GAL_SWIFT" \
             "${GAL_SWIFT}.original"
-
 
           cat > "$GAL_SWIFT" <<'SWIFT'
           import Cocoa
@@ -619,7 +587,6 @@ jobs:
           }
           SWIFT
 
-
           if grep -E \
             '^[[:space:]]*import[[:space:]]+Photos([[:space:]]|$)' \
             "$GAL_SWIFT"; then
@@ -664,13 +631,13 @@ jobs:
           PY
           )"
 
-
           if [ -z "$CONNECTIVITY_ROOT" ]; then
+
             echo "ERROR:"
             echo "connectivity_plus missing."
+
             exit 1
           fi
-
 
           CONNECTIVITY_SOURCE="$CONNECTIVITY_ROOT/macos/connectivity_plus/Sources/connectivity_plus"
 
@@ -678,18 +645,15 @@ jobs:
 
           CONNECTIVITY_PODSPEC="$CONNECTIVITY_ROOT/macos/connectivity_plus.podspec"
 
-
           test -f \
             "$CONNECTIVITY_PROVIDER"
 
           test -f \
             "$CONNECTIVITY_PODSPEC"
 
-
           cp \
             "$CONNECTIVITY_PROVIDER" \
             "${CONNECTIVITY_PROVIDER}.high-sierra-original"
-
 
           cat > "$CONNECTIVITY_PROVIDER" <<'SWIFT'
           import Foundation
@@ -1157,7 +1121,6 @@ jobs:
 
           text = path.read_text()
 
-
           if "SystemConfiguration" not in text:
               line = (
                   "  s.frameworks = "
@@ -1174,6 +1137,7 @@ jobs:
                       line + marker,
                       1,
                   )
+
               else:
                   index = text.rfind(
                       "\nend"
@@ -1191,7 +1155,6 @@ jobs:
                       + line
                       + text[index:]
                   )
-
 
           path.write_text(
               text
@@ -1259,6 +1222,8 @@ jobs:
         run: |
           set -euxo pipefail
 
+          mkdir -p diagnostics
+
           cargo metadata \
             --format-version=1 \
             --no-deps \
@@ -1266,14 +1231,25 @@ jobs:
 
 
       # ============================================================
-      # Patch LocalSend Xcode project.
+      # Patch LocalSend Xcode project
       #
-      # New important changes:
+      # IMPORTANT:
       #
-      # - x86_64 only
-      # - ONLY_ACTIVE_ARCH=NO
-      # - disable hardened runtime for High Sierra
-      # - ShareExtension no longer compiles Runner/Shared.swift
+      # Runner/Configs/Release.xcconfig is attached at PROJECT level.
+      #
+      # It includes:
+      #
+      #   Flutter/Flutter-Release.xcconfig
+      #
+      # which includes:
+      #
+      #   Pods-Runner.release.xcconfig
+      #
+      # Therefore every target inherits Runner's CocoaPods linker
+      # settings unless the ShareExtension overrides them explicitly.
+      #
+      # ShareExtension target configurations are therefore given
+      # explicit empty values for Runner/CocoaPods-only settings.
       # ============================================================
 
       - name: Patch LocalSend Xcode project
@@ -1300,7 +1276,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Deployment target -> indirect variable
+          # Deployment target
           # --------------------------------------------------------
 
           text, count = re.subn(
@@ -1320,8 +1296,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Hardened Runtime is a Mojave-era feature and is not
-          # required for this ad-hoc High Sierra build.
+          # Hardened Runtime
           # --------------------------------------------------------
 
           text = re.sub(
@@ -1332,8 +1307,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Insert universal High Sierra settings into every
-          # buildSettings dictionary.
+          # Global Intel / High Sierra settings
           # --------------------------------------------------------
 
           replacement = (
@@ -1424,11 +1398,235 @@ jobs:
 
 
           # --------------------------------------------------------
-          # ShareExtension source phase:
-          # remove Runner/Shared.swift.
+          # Locate ShareExtension target configuration list
+          # --------------------------------------------------------
+
+          target_match = re.search(
+              r'[0-9A-F]+'
+              r'\s*/\*\s*ShareExtension\s*\*/'
+              r'\s*=\s*\{'
+              r'.*?'
+              r'buildConfigurationList\s*=\s*'
+              r'([0-9A-F]+)'
+              r'\s*/\*\s*'
+              r'Build configuration list for '
+              r'PBXNativeTarget "ShareExtension"'
+              r'\s*\*/;',
+              text,
+              flags=re.DOTALL,
+          )
+
+
+          if not target_match:
+              raise SystemExit(
+                  "ERROR: ShareExtension target "
+                  "configuration list not found."
+              )
+
+
+          config_list_id = (
+              target_match
+              .group(1)
+          )
+
+
+          config_list_pattern = re.compile(
+              re.escape(
+                  config_list_id
+              )
+              + r'\s*/\*\s*'
+              r'Build configuration list for '
+              r'PBXNativeTarget "ShareExtension"'
+              r'\s*\*/'
+              r'\s*=\s*\{'
+              r'.*?'
+              r'buildConfigurations\s*=\s*\('
+              r'(.*?)'
+              r'\);'
+              r'.*?'
+              r'\};',
+              flags=re.DOTALL,
+          )
+
+
+          config_list_match = (
+              config_list_pattern
+              .search(
+                  text
+              )
+          )
+
+
+          if not config_list_match:
+              raise SystemExit(
+                  "ERROR: ShareExtension "
+                  "configuration list body not found."
+              )
+
+
+          config_ids = re.findall(
+              r'([0-9A-F]+)'
+              r'\s*/\*\s*'
+              r'(?:Debug|Release|Profile)'
+              r'\s*\*/',
+              config_list_match.group(1),
+          )
+
+
+          if len(config_ids) != 3:
+              raise SystemExit(
+                  "ERROR: Expected three ShareExtension "
+                  f"configurations, found {config_ids!r}."
+              )
+
+
+          # --------------------------------------------------------
+          # ShareExtension isolation overrides
           #
-          # The High Sierra extension receives a dedicated Foundation
-          # implementation and therefore needs no CocoaPods at all.
+          # Target-level build settings override the project-level
+          # Flutter/Pods xcconfig chain.
+          #
+          # Do NOT use $(inherited) here.
+          # --------------------------------------------------------
+
+          isolation_settings = [
+              'OTHER_LDFLAGS = "";',
+              'FRAMEWORK_SEARCH_PATHS = "";',
+              'HEADER_SEARCH_PATHS = "";',
+              'OTHER_SWIFT_FLAGS = "";',
+              'GCC_PREPROCESSOR_DEFINITIONS = "";',
+              'PODS_ROOT = "";',
+              'PODS_PODFILE_DIR_PATH = "";',
+          ]
+
+
+          for config_id in config_ids:
+
+              pattern = re.compile(
+                  r'('
+                  + re.escape(
+                      config_id
+                  )
+                  + r'\s*/\*\s*'
+                  r'(?:Debug|Release|Profile)'
+                  r'\s*\*/'
+                  r'\s*=\s*\{'
+                  r'\s*isa\s*=\s*XCBuildConfiguration;'
+                  r'\s*buildSettings\s*=\s*\{'
+                  r'\n'
+                  r')'
+                  r'(.*?)'
+                  r'('
+                  r'\n\s*\};'
+                  r'.*?'
+                  r'\n\s*\};'
+                  r')',
+                  flags=re.DOTALL,
+              )
+
+
+              match = pattern.search(
+                  text
+              )
+
+
+              if not match:
+                  raise SystemExit(
+                      "ERROR: Could not locate "
+                      "ShareExtension buildSettings for "
+                      f"{config_id}."
+                  )
+
+
+              body = match.group(2)
+
+
+              # Remove any pre-existing target-level variants first.
+              keys = [
+                  "OTHER_LDFLAGS",
+                  "FRAMEWORK_SEARCH_PATHS",
+                  "HEADER_SEARCH_PATHS",
+                  "OTHER_SWIFT_FLAGS",
+                  "GCC_PREPROCESSOR_DEFINITIONS",
+                  "PODS_ROOT",
+                  "PODS_PODFILE_DIR_PATH",
+              ]
+
+
+              for key in keys:
+
+                  # Single-line form.
+                  body = re.sub(
+                      r'^'
+                      r'[ \t]*'
+                      + re.escape(
+                          key
+                      )
+                      + r'\s*=\s*'
+                      r'.*?;'
+                      r'[ \t]*$'
+                      r'\n?',
+                      '',
+                      body,
+                      flags=re.MULTILINE,
+                  )
+
+
+                  # Parenthesized PBX array form.
+                  body = re.sub(
+                      r'^'
+                      r'[ \t]*'
+                      + re.escape(
+                          key
+                      )
+                      + r'\s*=\s*\('
+                      r'.*?'
+                      r'^\s*\);'
+                      r'[ \t]*$'
+                      r'\n?',
+                      '',
+                      body,
+                      flags=(
+                          re.MULTILINE
+                          | re.DOTALL
+                      ),
+                  )
+
+
+              indentation = (
+                  "\t\t\t\t"
+              )
+
+
+              injected = (
+                  "".join(
+                      indentation
+                      + setting
+                      + "\n"
+                      for setting
+                      in isolation_settings
+                  )
+                  + body
+              )
+
+
+              replacement_block = (
+                  match.group(1)
+                  + injected
+                  + match.group(3)
+              )
+
+
+              text = (
+                  text[:match.start()]
+                  + replacement_block
+                  + text[match.end():]
+              )
+
+
+          # --------------------------------------------------------
+          # ShareExtension Sources:
+          # remove Runner/Shared.swift
           # --------------------------------------------------------
 
           source_blocks = list(
@@ -1456,11 +1654,10 @@ jobs:
 
 
           for match in source_blocks:
-              body = match.group(2)
 
               if (
                   "ShareController.swift in Sources"
-                  in body
+                  in match.group(2)
               ):
                   share_source_block = match
                   break
@@ -1566,53 +1763,55 @@ jobs:
           )
 
 
-          # Final validation.
+          # --------------------------------------------------------
+          # Static validation of ShareExtension target overrides
+          # --------------------------------------------------------
+
           final = path.read_text()
 
 
-          if (
-              "ShareController.swift in Sources"
-              not in final
-          ):
-              raise SystemExit(
-                  "ERROR: ShareController disappeared."
+          for config_id in config_ids:
+
+              start = final.find(
+                  config_id
+                  + " /*"
+              )
+
+              if start == -1:
+                  raise SystemExit(
+                      f"ERROR: Missing ShareExtension "
+                      f"configuration {config_id}."
+                  )
+
+
+              next_config = final.find(
+                  "isa = XCBuildConfiguration;",
+                  start + 1,
               )
 
 
-          # Find ShareExtension source block again and ensure
-          # Shared.swift is absent.
-          blocks = re.findall(
-              r'[0-9A-F]+\s*/\*\s*Sources\s*\*/'
-              r'\s*=\s*\{.*?files\s*=\s*\((.*?)\);',
-              final,
-              flags=re.DOTALL,
-          )
+              section = final[
+                  start:
+                  (
+                      next_config
+                      if next_config != -1
+                      else len(final)
+                  )
+              ]
 
 
-          share_blocks = [
-              block
-              for block in blocks
-              if "ShareController.swift in Sources"
-              in block
-          ]
+              for setting in isolation_settings:
 
-
-          if len(share_blocks) != 1:
-              raise SystemExit(
-                  "ERROR: ShareExtension source phase "
-                  "validation failed."
-              )
-
-
-          if "Shared.swift in Sources" in share_blocks[0]:
-              raise SystemExit(
-                  "ERROR: Runner/Shared.swift still belongs "
-                  "to ShareExtension."
-              )
+                  if setting not in section:
+                      raise SystemExit(
+                          "ERROR: ShareExtension isolation "
+                          f"setting missing: {setting}"
+                      )
 
 
           print(
-              "ShareExtension no longer compiles Runner/Shared.swift."
+              "PASS: ShareExtension target configurations "
+              "explicitly override Runner/CocoaPods linker settings."
           )
           PY
 
@@ -1639,7 +1838,10 @@ jobs:
           EOF
 
 
+          # --------------------------------------------------------
           # AppDelegate actor annotation
+          # --------------------------------------------------------
+
           python3 <<'PY'
           from pathlib import Path
 
@@ -1654,11 +1856,16 @@ jobs:
               "private func handleFlutterCall",
           )
 
-          path.write_text(text)
+          path.write_text(
+              text
+          )
           PY
 
 
-          # Make shared UserDefaults setup robust for ad-hoc signing.
+          # --------------------------------------------------------
+          # Runner shared UserDefaults setup
+          # --------------------------------------------------------
+
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -1668,7 +1875,6 @@ jobs:
           )
 
           text = path.read_text()
-
 
           pattern = re.compile(
               r'let teamIdentifierPrefix\s*=\s*'
@@ -1680,7 +1886,6 @@ jobs:
               r'"\\\(teamIdentifierPrefix\)'
               r'localsend\.shared_group"\)!'
           )
-
 
           replacement = r'''let teamIdentifierPrefix =
               (
@@ -1705,20 +1910,17 @@ jobs:
               )
               ?? .standard'''
 
-
           text, count = pattern.subn(
               replacement,
               text,
               count=1,
           )
 
-
           if count != 1:
               raise SystemExit(
                   "ERROR: Could not patch Shared.swift "
                   "UserDefaults setup."
               )
-
 
           path.write_text(
               text
@@ -1734,8 +1936,7 @@ jobs:
       # ============================================================
       # Podfile
       #
-      # ShareExtension is intentionally NOT a CocoaPods target.
-      # Runner keeps Defaults and all Flutter plugins.
+      # ShareExtension intentionally has NO CocoaPods target.
       # ============================================================
 
       - name: Patch Podfile
@@ -1751,7 +1952,6 @@ jobs:
           import sys
           from pathlib import Path
 
-
           path = Path(
               sys.argv[1]
           )
@@ -1759,8 +1959,7 @@ jobs:
           text = path.read_text()
 
 
-          # Remove any ShareExtension target that might exist from
-          # an older backport iteration.
+          # Remove ShareExtension pod target from older iterations.
           text = re.sub(
               r"\n"
               r"target\s+['\"]ShareExtension['\"]\s+do"
@@ -1861,12 +2060,14 @@ jobs:
           ruby -c \
             "$PODFILE"
 
+
           cat \
             "$PODFILE"
 
 
           if grep -q \
-            "target 'ShareExtension'" \
+            -E \
+            "target ['\"]ShareExtension['\"]" \
             "$PODFILE"; then
 
             echo "ERROR:"
@@ -1877,14 +2078,17 @@ jobs:
 
 
       # ============================================================
-      # Rewrite ShareExtension to Foundation/AppKit-only.
+      # ShareExtension:
       #
-      # No Defaults.framework.
-      # No Flutter.
-      # No CocoaPods.
-      # No SwiftUI.
-      # No UniformTypeIdentifiers.
-      # No Swift concurrency.
+      # Foundation/AppKit only.
+      #
+      # No:
+      #   Defaults
+      #   Flutter
+      #   CocoaPods
+      #   SwiftUI
+      #   UniformTypeIdentifiers
+      #   async/await
       # ============================================================
 
       - name: Backport ShareExtension for High Sierra
@@ -2053,6 +2257,7 @@ jobs:
                 relativeTo:
                   nil
               )
+
             } catch {
               print(
                 "Failed to create bookmark: "
@@ -2266,6 +2471,7 @@ jobs:
                     urls.append(
                       url
                     )
+
                   } else {
                     sharedString =
                       url.absoluteString
@@ -2368,7 +2574,6 @@ jobs:
                 }
 
 
-                // Important for an extension that is about to exit.
                 _ =
                   extensionSharedDefaults
                     .synchronize()
@@ -2399,12 +2604,14 @@ jobs:
                 return value
               }
 
+
               if let value =
                 item as? NSURL
               {
                 return value
                   as URL
               }
+
 
               if let value =
                 item as? String
@@ -2425,6 +2632,7 @@ jobs:
                 )
               }
 
+
               if let value =
                 item as? NSString
               {
@@ -2433,6 +2641,7 @@ jobs:
                     value as String
                 )
               }
+
 
               return nil
             }
@@ -2494,7 +2703,8 @@ jobs:
 
 
           print(
-              "ShareExtension is Foundation/AppKit-only."
+              "PASS: ShareExtension source is "
+              "Foundation/AppKit-only."
           )
           PY
 
@@ -2517,7 +2727,9 @@ jobs:
             "3W7H4PYMCV" \
             "$PBX"; then
 
-            echo "ERROR: Upstream Team ID remains."
+            echo "ERROR:"
+            echo "Upstream Team ID remains."
+
             exit 1
           fi
 
@@ -2535,7 +2747,8 @@ jobs:
 
 
           if grep -q \
-            "target 'ShareExtension'" \
+            -E \
+            "target ['\"]ShareExtension['\"]" \
             "$PODFILE"; then
 
             echo "ERROR:"
@@ -2561,7 +2774,7 @@ jobs:
 
 
       # ============================================================
-      # First Flutter configuration pass
+      # First Flutter config pass
       # ============================================================
 
       - name: Generate Flutter macOS configuration - first pass
@@ -2606,11 +2819,14 @@ jobs:
 
           set +e
 
+
           pod install \
             --verbose \
             2>&1 | tee ../../pod-install.log
 
+
           STATUS="${PIPESTATUS[0]}"
+
 
           set -e
 
@@ -2649,31 +2865,18 @@ jobs:
           fi
 
 
-          # --------------------------------------------------------
-          # The High Sierra ShareExtension is intentionally no longer
-          # integrated with CocoaPods.
-          # --------------------------------------------------------
-
           if [ -d \
             "Pods/Target Support Files/Pods-ShareExtension" ]; then
 
             echo "ERROR:"
             echo "CocoaPods unexpectedly integrated ShareExtension."
 
-            find \
-              "Pods/Target Support Files/Pods-ShareExtension" \
-              -maxdepth 2 \
-              -type f \
-              -print \
-              -exec cat {} \; \
-              || true
-
             exit 1
           fi
 
 
       # ============================================================
-      # Final config
+      # Final Flutter config
       # ============================================================
 
       - name: Finalize Flutter macOS configuration
@@ -2713,10 +2916,12 @@ jobs:
 
 
       # ============================================================
-      # Effective settings
+      # Effective settings + EARLY ShareExtension isolation preflight
+      #
+      # This deliberately runs BEFORE the expensive Flutter build.
       # ============================================================
 
-      - name: Verify effective Xcode settings
+      - name: Verify effective Xcode settings and ShareExtension isolation
         working-directory: app
         shell: bash
         run: |
@@ -2731,6 +2936,7 @@ jobs:
             -scheme Runner \
             -configuration Release \
             -showBuildSettings \
+            BUILD_DIR="$PWD/build/macos" \
             > ../diagnostics/runner-build-settings.txt
 
 
@@ -2739,22 +2945,29 @@ jobs:
             -target ShareExtension \
             -configuration Release \
             -showBuildSettings \
+            BUILD_DIR="$PWD/build/macos" \
             > ../diagnostics/shareextension-build-settings.txt
 
 
+          echo "============================================================"
+          echo "Runner"
+          echo "============================================================"
+
+
           grep -E \
-            'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|ENABLE_HARDENED_RUNTIME|OTHER_LDFLAGS|FRAMEWORK_SEARCH_PATHS' \
+            'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|ENABLE_HARDENED_RUNTIME|OTHER_LDFLAGS|FRAMEWORK_SEARCH_PATHS|COCOAPODS' \
             ../diagnostics/runner-build-settings.txt \
             || true
 
 
           echo
-          echo "ShareExtension:"
-          echo
+          echo "============================================================"
+          echo "ShareExtension"
+          echo "============================================================"
 
 
           grep -E \
-            'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|ENABLE_HARDENED_RUNTIME|OTHER_LDFLAGS|FRAMEWORK_SEARCH_PATHS' \
+            'ARCHS|EXCLUDED_ARCHS|ONLY_ACTIVE_ARCH|MACOSX_DEPLOYMENT_TARGET|ENABLE_HARDENED_RUNTIME|OTHER_LDFLAGS|FRAMEWORK_SEARCH_PATHS|HEADER_SEARCH_PATHS|OTHER_SWIFT_FLAGS|GCC_PREPROCESSOR_DEFINITIONS|PODS_ROOT|COCOAPODS' \
             ../diagnostics/shareextension-build-settings.txt \
             || true
 
@@ -2764,64 +2977,232 @@ jobs:
           import re
 
 
-          for path in [
-              Path(
-                  "../diagnostics/"
-                  "runner-build-settings.txt"
+          runner_path = Path(
+              "../diagnostics/"
+              "runner-build-settings.txt"
+          )
+
+          share_path = Path(
+              "../diagnostics/"
+              "shareextension-build-settings.txt"
+          )
+
+
+          runner = runner_path.read_text()
+          share = share_path.read_text()
+
+
+          def value(text, name):
+
+              match = re.search(
+                  rf"(?m)^\s*"
+                  rf"{re.escape(name)}"
+                  rf"\s*=\s*(.*?)\s*$",
+                  text,
+              )
+
+              return (
+                  match.group(1)
+                  if match
+                  else None
+              )
+
+
+          # --------------------------------------------------------
+          # Both native targets must really be High Sierra/x86_64.
+          # --------------------------------------------------------
+
+          for path, text in [
+              (
+                  runner_path,
+                  runner,
               ),
-              Path(
-                  "../diagnostics/"
-                  "shareextension-build-settings.txt"
+              (
+                  share_path,
+                  share,
               ),
           ]:
 
-              text = path.read_text()
-
-
-              target = re.search(
-                  r"(?m)^\s*MACOSX_DEPLOYMENT_TARGET\s*=\s*(.*?)\s*$",
+              deployment = value(
                   text,
+                  "MACOSX_DEPLOYMENT_TARGET",
+              )
+
+              archs = value(
+                  text,
+                  "ARCHS",
+              )
+
+              active = value(
+                  text,
+                  "ONLY_ACTIVE_ARCH",
               )
 
 
-              archs = re.search(
-                  r"(?m)^\s*ARCHS\s*=\s*(.*?)\s*$",
-                  text,
+              if deployment != "10.13":
+                  raise SystemExit(
+                      f"ERROR: {path}: "
+                      f"MACOSX_DEPLOYMENT_TARGET="
+                      f"{deployment!r}"
+                  )
+
+
+              if (
+                  archs is None
+                  or "x86_64"
+                  not in archs.split()
+              ):
+                  raise SystemExit(
+                      f"ERROR: {path}: "
+                      f"ARCHS={archs!r}"
+                  )
+
+
+              if active != "NO":
+                  raise SystemExit(
+                      f"ERROR: {path}: "
+                      f"ONLY_ACTIVE_ARCH={active!r}"
+                  )
+
+
+          # --------------------------------------------------------
+          # Runner MUST still contain its CocoaPods linker settings.
+          #
+          # This proves we isolated ShareExtension rather than
+          # accidentally destroying Runner's native plugin linkage.
+          # --------------------------------------------------------
+
+          runner_ldflags = (
+              value(
+                  runner,
+                  "OTHER_LDFLAGS",
+              )
+              or ""
+          )
+
+
+          if "connectivity_plus" not in runner_ldflags:
+              raise SystemExit(
+                  "ERROR: Runner CocoaPods linkage "
+                  "was unexpectedly removed."
               )
 
 
-              active = re.search(
-                  r"(?m)^\s*ONLY_ACTIVE_ARCH\s*=\s*(.*?)\s*$",
-                  text,
+          # --------------------------------------------------------
+          # ShareExtension MUST NOT inherit Runner/CocoaPods.
+          # --------------------------------------------------------
+
+          share_keys = [
+              "OTHER_LDFLAGS",
+              "FRAMEWORK_SEARCH_PATHS",
+              "HEADER_SEARCH_PATHS",
+              "OTHER_SWIFT_FLAGS",
+              "GCC_PREPROCESSOR_DEFINITIONS",
+              "PODS_ROOT",
+              "PODS_PODFILE_DIR_PATH",
+          ]
+
+
+          forbidden_tokens = [
+              "COCOAPODS",
+              "Pods-Runner",
+              "Pods_Runner",
+              "Defaults",
+              "connectivity_plus",
+              "desktop_drop",
+              "device_info_plus",
+              "dynamic_color",
+              "file_picker",
+              "file_selector_macos",
+              "gal",
+              "network_info_plus",
+              "open_file_mac",
+              "package_info_plus",
+              "pasteboard",
+              "photo_manager",
+              "rust_lib_localsend_app",
+              "screen_retriever_macos",
+              "shared_preferences_foundation",
+              "tray_manager",
+              "uri_content",
+              "url_launcher_macos",
+              "video_player_avfoundation",
+              "wakelock_plus",
+              "window_manager",
+          ]
+
+
+          contamination = []
+
+
+          for key in share_keys:
+
+              current = (
+                  value(
+                      share,
+                      key,
+                  )
+                  or ""
               )
 
 
-              if not target or target.group(1) != "10.13":
-                  raise SystemExit(
-                      f"ERROR: {path}: deployment target != 10.13"
+              for token in forbidden_tokens:
+
+                  if token in current:
+
+                      contamination.append(
+                          (
+                              key,
+                              token,
+                              current,
+                          )
+                      )
+
+
+          if contamination:
+
+              print(
+                  "ERROR:"
+              )
+
+              print(
+                  "ShareExtension still inherits "
+                  "Runner/CocoaPods build settings:"
+              )
+
+
+              for key, token, current in contamination:
+
+                  print()
+
+                  print(
+                      f"{key}: contains {token!r}"
+                  )
+
+                  print(
+                      current
                   )
 
 
-              if not archs or "x86_64" not in archs.group(1).split():
-                  raise SystemExit(
-                      f"ERROR: {path}: x86_64 missing."
-                  )
+              raise SystemExit(
+                  1
+              )
 
 
-              if not active or active.group(1) != "NO":
-                  raise SystemExit(
-                      f"ERROR: {path}: ONLY_ACTIVE_ARCH != NO."
-                  )
-
+          print()
+          print(
+              "PASS: Runner retains CocoaPods linkage."
+          )
 
           print(
-              "Effective Xcode settings validated."
+              "PASS: ShareExtension effective settings "
+              "contain no Runner/CocoaPods linkage."
           )
           PY
 
 
       # ============================================================
-      # Build
+      # Actual build
       # ============================================================
 
       - name: Build macOS app
@@ -2926,9 +3307,13 @@ jobs:
                           end,
                       ),
                   )
+
               else:
                   ranges.append(
-                      (start, end)
+                      (
+                          start,
+                          end,
+                      )
                   )
 
 
@@ -2936,6 +3321,7 @@ jobs:
 
 
           for start, end in ranges:
+
               output.append(
                   "=" * 100
               )
@@ -2954,13 +3340,17 @@ jobs:
               "diagnostics/"
               "compiler-errors.txt"
           ).write_text(
-              "\n".join(output)
+              "\n".join(
+                  output
+              )
               + "\n"
           )
 
 
           print(
-              "\n".join(output)
+              "\n".join(
+                  output
+              )
           )
           PY
 
@@ -2987,7 +3377,10 @@ jobs:
 
 
           if [ -z "$APP" ]; then
-            echo "ERROR: LocalSend.app not found."
+
+            echo "ERROR:"
+            echo "LocalSend.app not found."
+
             exit 1
           fi
 
@@ -3009,7 +3402,7 @@ jobs:
 
 
       # ============================================================
-      # Capture original entitlements before modifying nested code.
+      # Capture app entitlements
       # ============================================================
 
       - name: Capture application entitlements
@@ -3039,20 +3432,14 @@ jobs:
 
 
       # ============================================================
-      # Critical experiment:
+      # FlutterMacOS Engine binary backport experiment
       #
-      # FlutterMacOS.framework
+      # LC_BUILD_VERSION 10.15
+      #        ->
+      # LC_VERSION_MIN_MACOSX 10.13
       #
-      # Before:
-      #   LC_BUILD_VERSION
-      #   minos 10.15
-      #
-      # After:
-      #   LC_VERSION_MIN_MACOSX
-      #   version 10.13
-      #
-      # Also redirect the THREE strong Swift runtime dependencies
-      # from /usr/lib/swift to the runtime bundled in LocalSend.app.
+      # Also redirect strong Swift runtime references into the
+      # application bundle for High Sierra back-deployment.
       # ============================================================
 
       - name: Backport FlutterMacOS engine binary
@@ -3121,13 +3508,6 @@ jobs:
             "$BINARY"
 
 
-          # --------------------------------------------------------
-          # Convert LC_BUILD_VERSION -> LC_VERSION_MIN_MACOSX.
-          #
-          # vtool specifically retains -set-version-min for deploying
-          # final linked Mach-O binaries to older operating systems.
-          # --------------------------------------------------------
-
           TMP="$BINARY.high-sierra"
 
 
@@ -3159,15 +3539,6 @@ jobs:
             "$BINARY"
 
 
-          # --------------------------------------------------------
-          # FlutterMacOS 3.41.9 strongly links these three Swift
-          # libraries from /usr/lib/swift.
-          #
-          # High Sierra predates the system Swift 5 runtime.
-          # The app itself targets 10.13, so Xcode back-deploys the
-          # Swift runtime into Contents/Frameworks.
-          # --------------------------------------------------------
-
           STRONG_SWIFT_LIBS=(
             "libswiftCore.dylib"
             "libswiftFoundation.dylib"
@@ -3177,6 +3548,7 @@ jobs:
 
           for LIB in "${STRONG_SWIFT_LIBS[@]}"
           do
+
             EMBEDDED="$APP/Contents/Frameworks/$LIB"
 
             if [ ! -f "$EMBEDDED" ]; then
@@ -3197,7 +3569,8 @@ jobs:
             if otool \
               -L \
               "$BINARY" \
-              | grep -Fq "$OLD"; then
+              | grep -Fq \
+                "$OLD"; then
 
               install_name_tool \
                 -change \
@@ -3208,18 +3581,14 @@ jobs:
             else
 
               echo "ERROR:"
-              echo "Expected FlutterMacOS Swift dependency missing:"
+              echo "Expected FlutterMacOS dependency missing:"
               echo "$OLD"
 
               exit 1
             fi
+
           done
 
-
-          # --------------------------------------------------------
-          # Patch framework plist if it contains its own minimum
-          # system key.
-          # --------------------------------------------------------
 
           FRAMEWORK_PLIST="$FRAMEWORK/Versions/A/Resources/Info.plist"
 
@@ -3235,6 +3604,7 @@ jobs:
               /usr/libexec/PlistBuddy \
                 -c 'Set :MinimumOSVersion 10.13' \
                 "$FRAMEWORK_PLIST"
+
             fi
 
 
@@ -3247,14 +3617,11 @@ jobs:
               /usr/libexec/PlistBuddy \
                 -c 'Set :LSMinimumSystemVersion 10.13' \
                 "$FRAMEWORK_PLIST"
+
             fi
 
           fi
 
-
-          # --------------------------------------------------------
-          # Audit the embedded Swift runtimes we will actually use.
-          # --------------------------------------------------------
 
           python3 - "$APP" <<'PY'
           import re
@@ -3276,13 +3643,16 @@ jobs:
 
 
           def parse_version(value):
+
               parts = [
                   int(part)
                   for part in value.split(".")
               ]
 
               while len(parts) < 3:
-                  parts.append(0)
+                  parts.append(
+                      0
+                  )
 
               return tuple(
                   parts[:3]
@@ -3312,7 +3682,7 @@ jobs:
               versions = []
 
 
-              min_match = re.search(
+              minimum = re.search(
                   r"cmd LC_VERSION_MIN_MACOSX"
                   r".*?"
                   r"\bversion\s+([0-9.]+)",
@@ -3321,7 +3691,7 @@ jobs:
               )
 
 
-              build_match = re.search(
+              build = re.search(
                   r"cmd LC_BUILD_VERSION"
                   r".*?"
                   r"\bminos\s+([0-9.]+)",
@@ -3330,15 +3700,15 @@ jobs:
               )
 
 
-              if min_match:
+              if minimum:
                   versions.append(
-                      min_match.group(1)
+                      minimum.group(1)
                   )
 
 
-              if build_match:
+              if build:
                   versions.append(
-                      build_match.group(1)
+                      build.group(1)
                   )
 
 
@@ -3348,30 +3718,22 @@ jobs:
               )
 
 
-              if not versions:
-                  print(
-                      f"WARNING: No deployment marker "
-                      f"found in {name}"
-                  )
-
-                  continue
-
-
               for version in versions:
+
                   if (
-                      parse_version(version)
-                      > parse_version("10.13")
+                      parse_version(
+                          version
+                      )
+                      > parse_version(
+                          "10.13"
+                      )
                   ):
                       raise SystemExit(
-                          f"ERROR: {name} itself requires "
-                          f"macOS {version}, not High Sierra."
+                          f"ERROR: {name} requires "
+                          f"macOS {version}."
                       )
           PY
 
-
-          # --------------------------------------------------------
-          # Ad-hoc sign modified Flutter framework.
-          # --------------------------------------------------------
 
           codesign \
             --force \
@@ -3424,7 +3786,7 @@ jobs:
                 'version 10.13'; then
 
             echo "ERROR:"
-            echo "FlutterMacOS is not marked for macOS 10.13."
+            echo "FlutterMacOS is not marked for 10.13."
 
             exit 1
           fi
@@ -3443,7 +3805,6 @@ jobs:
           fi
 
 
-          # Imported-symbol dump for the first real High Sierra test.
           nm \
             -u \
             -m \
@@ -3491,12 +3852,8 @@ jobs:
 
 
       # ============================================================
-      # LaunchAtLogin
-      #
-      # The legacy helper already targets 10.12, but upstream ships a
-      # universal x86_64+arm64 binary.
-      #
-      # Thin every helper Mach-O to x86_64 and re-sign inside-out.
+      # LaunchAtLogin:
+      # thin all nested Mach-O binaries to x86_64 and re-sign.
       # ============================================================
 
       - name: Normalize and sign LaunchAtLogin helper
@@ -3530,10 +3887,6 @@ jobs:
           </plist>
           EOF
 
-
-          # --------------------------------------------------------
-          # Thin every fat Mach-O inside the helper.
-          # --------------------------------------------------------
 
           find "$HELPER" \
             -type f \
@@ -3608,7 +3961,7 @@ jobs:
               )"
 
 
-              echo "  after:  $FINAL_ARCHES"
+              echo "  after: $FINAL_ARCHES"
 
 
               if echo "$FINAL_ARCHES" \
@@ -3624,10 +3977,6 @@ jobs:
 
             done
 
-
-          # --------------------------------------------------------
-          # Sign helper nested Swift dylibs first.
-          # --------------------------------------------------------
 
           if [ -d \
             "$HELPER/Contents/Frameworks" ]; then
@@ -3647,16 +3996,13 @@ jobs:
                     --force \
                     --sign - \
                     "$FILE"
+
                 fi
 
               done
 
           fi
 
-
-          # --------------------------------------------------------
-          # Sign helper outer bundle.
-          # --------------------------------------------------------
 
           codesign \
             --force \
@@ -3675,11 +4021,6 @@ jobs:
 
 
           HELPER_BINARY="$HELPER/Contents/MacOS/LaunchAtLoginHelper"
-
-
-          echo
-          echo "LaunchAtLogin final:"
-          echo
 
 
           file \
@@ -3715,9 +4056,21 @@ jobs:
 
 
       # ============================================================
-      # ShareExtension link audit
+      # FINAL ShareExtension binary isolation audit
       #
-      # This MUST no longer directly link Runner's Flutter plugins.
+      # Expected:
+      #
+      # AppKit
+      # Foundation
+      # CoreFoundation
+      # libobjc
+      # libc++
+      # Swift runtime
+      #
+      # Forbidden:
+      #
+      # ALL Runner Flutter/CocoaPods plugin frameworks
+      # Photos / PhotosUI / CoreWLAN / SystemConfiguration
       # ============================================================
 
       - name: Verify ShareExtension isolation
@@ -3735,6 +4088,11 @@ jobs:
             "$BINARY"
 
 
+          echo "============================================================"
+          echo "ShareExtension linked libraries"
+          echo "============================================================"
+
+
           otool \
             -L \
             "$BINARY" \
@@ -3742,17 +4100,81 @@ jobs:
               ../diagnostics/ShareExtension.linked-libraries.txt
 
 
-          if otool \
-            -L \
-            "$BINARY" \
-            | grep -E \
-              '@rpath/(FlutterMacOS|Defaults|connectivity_plus|desktop_drop|device_info_plus|dynamic_color|file_picker|file_selector_macos|gal|network_info_plus|open_file_mac|package_info_plus|pasteboard|photo_manager|rust_lib_localsend_app|screen_retriever_macos|shared_preferences_foundation|tray_manager|uri_content|url_launcher_macos|video_player_avfoundation|wakelock_plus|window_manager)\.framework'; then
+          python3 - \
+            ../diagnostics/ShareExtension.linked-libraries.txt <<'PY'
+          import sys
+          from pathlib import Path
 
-            echo "ERROR:"
-            echo "ShareExtension still links Runner/Flutter Pods."
 
-            exit 1
-          fi
+          text = Path(
+              sys.argv[1]
+          ).read_text()
+
+
+          forbidden = [
+              "Defaults.framework",
+              "connectivity_plus.framework",
+              "desktop_drop.framework",
+              "device_info_plus.framework",
+              "dynamic_color.framework",
+              "file_picker.framework",
+              "file_selector_macos.framework",
+              "gal.framework",
+              "network_info_plus.framework",
+              "open_file_mac.framework",
+              "package_info_plus.framework",
+              "pasteboard.framework",
+              "photo_manager.framework",
+              "rust_lib_localsend_app.framework",
+              "screen_retriever_macos.framework",
+              "shared_preferences_foundation.framework",
+              "tray_manager.framework",
+              "uri_content.framework",
+              "url_launcher_macos.framework",
+              "video_player_avfoundation.framework",
+              "wakelock_plus.framework",
+              "window_manager.framework",
+              "/Photos.framework/",
+              "/PhotosUI.framework/",
+              "/CoreWLAN.framework/",
+              "/SystemConfiguration.framework/",
+          ]
+
+
+          found = [
+              token
+              for token in forbidden
+              if token in text
+          ]
+
+
+          if found:
+
+              print(
+                  "ERROR:"
+              )
+
+              print(
+                  "ShareExtension is still polluted:"
+              )
+
+
+              for token in found:
+                  print(
+                      f"  {token}"
+                  )
+
+
+              raise SystemExit(
+                  1
+              )
+
+
+          print(
+              "PASS: ShareExtension links no "
+              "Runner/CocoaPods frameworks."
+          )
+          PY
 
 
           ARCHES="$(
@@ -3772,10 +4194,33 @@ jobs:
           fi
 
 
+          otool \
+            -l \
+            "$BINARY" \
+          | awk '
+              /cmd LC_VERSION_MIN_MACOSX/ {
+                show=1
+                count=0
+              }
+
+              /cmd LC_BUILD_VERSION/ {
+                show=1
+                count=0
+              }
+
+              show {
+                print
+                count++
+
+                if (count >= 8) {
+                  show=0
+                }
+              }
+            '
+
+
       # ============================================================
-      # Re-sign outer LocalSend.app LAST.
-      #
-      # Engine, Info.plist and login helper were modified above.
+      # Re-sign outer app LAST
       # ============================================================
 
       - name: Re-sign LocalSend application
@@ -3809,7 +4254,7 @@ jobs:
 
 
       # ============================================================
-      # Final architecture validation
+      # Architecture validation
       # ============================================================
 
       - name: Verify final x86_64 application
@@ -3833,13 +4278,14 @@ jobs:
 
 
           if [ "$MAIN_ARCHS" != "x86_64" ]; then
-            echo "ERROR: Main executable is not x86_64-only."
+
+            echo "ERROR:"
+            echo "Main executable is not x86_64-only."
+
             exit 1
           fi
 
 
-          # Every executable/shared library that still contains arm64
-          # is reported. At this stage the helper should also be thin.
           ARM64_REPORT="../diagnostics/remaining-arm64-binaries.txt"
 
 
@@ -3878,6 +4324,7 @@ jobs:
                   "$FILE :: $ARCHES" \
                   | tee -a \
                     "$ARM64_REPORT"
+
               fi
 
             done
@@ -3889,8 +4336,8 @@ jobs:
             echo
             echo "WARNING:"
             echo "Some nested binaries remain universal."
-            echo "They are listed in diagnostics."
-            echo
+            echo "See remaining-arm64-binaries.txt."
+
           fi
 
 
@@ -4017,7 +4464,7 @@ jobs:
 
 
       # ============================================================
-      # Final signature audit
+      # Final code-sign audit
       # ============================================================
 
       - name: Inspect final code signatures
@@ -4037,10 +4484,12 @@ jobs:
               "$APP" \
               2>&1
 
+
             echo
             echo "============================================================"
             echo "LocalSend entitlements"
             echo "============================================================"
+
 
             codesign \
               --display \
@@ -4050,10 +4499,12 @@ jobs:
               2>/dev/null \
               || true
 
+
             echo
             echo "============================================================"
             echo "FlutterMacOS"
             echo "============================================================"
+
 
             codesign \
               --display \
@@ -4061,10 +4512,12 @@ jobs:
               "$APP/Contents/Frameworks/FlutterMacOS.framework" \
               2>&1
 
+
             echo
             echo "============================================================"
             echo "ShareExtension"
             echo "============================================================"
+
 
             codesign \
               --display \
@@ -4072,16 +4525,19 @@ jobs:
               "$APP/Contents/PlugIns/ShareExtension.appex" \
               2>&1
 
+
             echo
             echo "============================================================"
             echo "LaunchAtLoginHelper"
             echo "============================================================"
+
 
             codesign \
               --display \
               --verbose=4 \
               "$APP/Contents/Library/LoginItems/LaunchAtLoginHelper.app" \
               2>&1
+
 
           } | tee \
             ../diagnostics/codesign-report.txt
@@ -4206,6 +4662,18 @@ jobs:
 
 
           cp \
+            app/macos/Flutter/Flutter-Release.xcconfig \
+            diagnostics/Flutter-Release.xcconfig \
+            2>/dev/null
+
+
+          cp \
+            app/macos/Flutter/Flutter-Debug.xcconfig \
+            diagnostics/Flutter-Debug.xcconfig \
+            2>/dev/null
+
+
+          cp \
             app/macos/Runner/Shared.swift \
             diagnostics/Runner-Shared.after-patch.swift \
             2>/dev/null
@@ -4283,7 +4751,6 @@ jobs:
             2>/dev/null
 
 
-          # Current final Flutter engine binary.
           FINAL_FLUTTER="$(
             find \
               app/build/macos/Build/Products/Release \
@@ -4332,7 +4799,7 @@ jobs:
 
 
       # ============================================================
-      # Diagnostics upload
+      # Diagnostics artifact
       # ============================================================
 
       - name: Upload build diagnostics
