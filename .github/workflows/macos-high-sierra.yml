@@ -50,11 +50,18 @@ jobs:
 
 
       # ============================================================
-      # Flutter 3.41.9 itself generates FlutterMacOS.podspec with:
+      # FlutterMacOS CocoaPods minimum target
       #
-      #   s.osx.deployment_target = '10.15'
+      # Flutter 3.41.9 generates:
       #
-      # Patch the generator, not the ephemeral generated file.
+      #   Flutter/ephemeral/FlutterMacOS.podspec
+      #
+      # from:
+      #
+      #   packages/flutter_tools/bin/podhelper.rb
+      #
+      # Upstream target: 10.15
+      # Legacy target:   10.13
       # ============================================================
 
       - name: Backport FlutterMacOS podspec generator
@@ -71,7 +78,7 @@ jobs:
             flutter-podhelper.rb.original
 
           echo "============================================================"
-          echo "FlutterMacOS podspec generator before patch"
+          echo "FlutterMacOS podhelper before patch"
           echo "============================================================"
 
           grep -n \
@@ -79,20 +86,15 @@ jobs:
             "$PODHELPER" \
             || true
 
-
           python3 - "$PODHELPER" <<'PY'
           import re
           import sys
           from pathlib import Path
 
-
           path = Path(sys.argv[1])
           text = path.read_text()
 
-
-          if "s.osx.deployment_target = '10.13'" in text:
-              print("Already patched.")
-          else:
+          if "s.osx.deployment_target = '10.13'" not in text:
               text, count = re.subn(
                   r"s\.osx\.deployment_target\s*=\s*['\"]10\.15['\"]",
                   "s.osx.deployment_target = '10.13'",
@@ -108,20 +110,20 @@ jobs:
 
               path.write_text(text)
 
-
           final = path.read_text()
 
           if "s.osx.deployment_target = '10.13'" not in final:
               raise SystemExit(
                   "ERROR: FlutterMacOS podspec generator "
-                  "does not target 10.13 after patch."
+                  "does not target 10.13."
               )
-          PY
 
+          print("FlutterMacOS podspec generator -> macOS 10.13")
+          PY
 
           echo
           echo "============================================================"
-          echo "FlutterMacOS podspec generator after patch"
+          echo "FlutterMacOS podhelper after patch"
           echo "============================================================"
 
           grep -n \
@@ -185,10 +187,10 @@ jobs:
 
 
       # ============================================================
-      # Remove in_app_purchase / StoreKit.
+      # Remove StoreKit / IAP
       #
-      # This follows LocalSend's upstream FOSS build mechanism.
-      # Current StoreKit plugin requires APIs newer than High Sierra.
+      # LocalSend upstream marks in_app_purchase with [FOSS_REMOVE].
+      # Current StoreKit implementation needs newer macOS APIs.
       # ============================================================
 
       - name: Remove in-app purchases for High Sierra
@@ -198,7 +200,6 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
-
 
           pubspec = Path("app/pubspec.yaml")
           lines = pubspec.read_text().splitlines()
@@ -229,7 +230,6 @@ jobs:
               + "\n"
           )
 
-
           files = [
               Path("app/lib/config/init.dart"),
               Path(
@@ -241,7 +241,6 @@ jobs:
                   "donation_page_vm.dart"
               ),
           ]
-
 
           for path in files:
               text = path.read_text()
@@ -268,7 +267,6 @@ jobs:
 
               path.write_text(text)
 
-
           provider = Path(
               "app/lib/provider/purchase_provider.dart"
           )
@@ -279,7 +277,6 @@ jobs:
               )
 
           provider.unlink()
-
 
           donation_page = Path(
               "app/lib/pages/donation/donation_page.dart"
@@ -294,7 +291,6 @@ jobs:
 
           donation_page.write_text(text)
 
-
           if "in_app_purchase:" in pubspec.read_text():
               raise SystemExit(
                   "ERROR: in_app_purchase remains in pubspec."
@@ -302,7 +298,6 @@ jobs:
 
           print("StoreKit / in-app purchase removed.")
           PY
-
 
           rm -f \
             app/macos/Podfile.lock
@@ -328,7 +323,7 @@ jobs:
 
 
       # ============================================================
-      # Verify StoreKit is gone
+      # Verify StoreKit is really gone
       # ============================================================
 
       - name: Verify in-app purchase plugin is gone
@@ -344,15 +339,15 @@ jobs:
 
           cd ..
 
-
           if grep -E \
             '(^|[[:space:]])in_app_purchase(_storekit)?([[:space:]]|$)' \
             flutter-pub-deps.txt; then
 
-            echo "ERROR: in_app_purchase remains in dependency graph."
+            echo "ERROR:"
+            echo "in_app_purchase remains in dependency graph."
+
             exit 1
           fi
-
 
           if [ -f app/.flutter-plugins-dependencies ]; then
 
@@ -360,65 +355,171 @@ jobs:
               'in_app_purchase_storekit' \
               app/.flutter-plugins-dependencies; then
 
-              echo "ERROR: in_app_purchase_storekit remains in plugin graph."
+              echo "ERROR:"
+              echo "in_app_purchase_storekit remains in plugin graph."
+
               exit 1
             fi
 
           fi
 
-
           echo "StoreKit plugin is absent."
 
 
       # ============================================================
-      # Cargokit / Rust
+      # Lower every actual CocoaPods-backed Flutter macOS plugin
+      # declaration to macOS 10.13.
+      #
+      # This only bypasses podspec declaration gates.
+      # Real API compatibility is handled separately below.
       # ============================================================
 
-      - name: Prepare Cargokit
-        working-directory: packages/localsend_isolates/rust_builder/cargokit/build_tool
-        shell: bash
-        run: |
-          set -euxo pipefail
-          flutter pub get
-
-      - name: Verify Rust workspace
+      - name: Backport macOS Flutter plugin podspecs
         shell: bash
         run: |
           set -euxo pipefail
 
-          test -f Cargo.toml
-          test -f rust-toolchain.toml
-          test -f packages/localsend_isolates/rust/Cargo.toml
+          PLUGINS_FILE="app/.flutter-plugins-dependencies"
 
-          cargo metadata \
-            --format-version=1 \
-            --no-deps \
-            > /tmp/cargo-metadata.json
+          test -f "$PLUGINS_FILE"
+
+          mkdir -p diagnostics
+
+          cp \
+            "$PLUGINS_FILE" \
+            diagnostics/flutter-plugins-dependencies.json
 
           python3 <<'PY'
           import json
+          import re
+          import shutil
+          from pathlib import Path
 
-          with open("/tmp/cargo-metadata.json", "r") as f:
-              metadata = json.load(f)
+          plugins_file = Path(
+              "app/.flutter-plugins-dependencies"
+          )
 
-          print("Rust workspace packages:")
+          data = json.loads(
+              plugins_file.read_text()
+          )
 
-          for package in metadata["packages"]:
-              print(
-                  f"  {package['name']} "
-                  f"{package['version']}"
+          plugins = (
+              data
+              .get("plugins", {})
+              .get("macos", [])
+          )
+
+          report = []
+
+          for plugin in plugins:
+              name = plugin.get("name")
+              raw_path = plugin.get("path")
+
+              if not name or not raw_path:
+                  continue
+
+              if not plugin.get("native_build", True):
+                  continue
+
+              platform_dir = (
+                  "darwin"
+                  if plugin.get(
+                      "shared_darwin_source",
+                      False,
+                  )
+                  else "macos"
               )
-              print(
-                  f"    {package['manifest_path']}"
+
+              podspec = (
+                  Path(raw_path)
+                  / platform_dir
+                  / f"{name}.podspec"
               )
+
+              if not podspec.exists():
+                  report.append({
+                      "plugin": name,
+                      "podspec": None,
+                      "status": "no podspec",
+                  })
+                  continue
+
+              original = podspec.read_text()
+              text = original
+
+              text = re.sub(
+                  r"("
+                  r"[A-Za-z_][A-Za-z0-9_]*"
+                  r"\.osx\.deployment_target"
+                  r"\s*=\s*"
+                  r")"
+                  r"(['\"])"
+                  r"[0-9.]+"
+                  r"\2",
+                  r"\1'10.13'",
+                  text,
+              )
+
+              text = re.sub(
+                  r"("
+                  r"[A-Za-z_][A-Za-z0-9_]*"
+                  r"\.platform"
+                  r"\s*=\s*"
+                  r":osx"
+                  r"\s*,\s*"
+                  r")"
+                  r"(['\"])"
+                  r"[0-9.]+"
+                  r"\2",
+                  r"\1'10.13'",
+                  text,
+              )
+
+              if text != original:
+                  backup = podspec.with_suffix(
+                      podspec.suffix
+                      + ".high-sierra-original"
+                  )
+
+                  if not backup.exists():
+                      shutil.copy2(
+                          podspec,
+                          backup,
+                      )
+
+                  podspec.write_text(text)
+
+                  status = "patched"
+              else:
+                  status = "unchanged"
+
+              report.append({
+                  "plugin": name,
+                  "podspec": str(podspec),
+                  "status": status,
+              })
+
+              print(
+                  f"{name}: {status}: {podspec}"
+              )
+
+          Path(
+              "diagnostics/"
+              "plugin-podspec-backport-report.json"
+          ).write_text(
+              json.dumps(
+                  report,
+                  indent=2,
+              )
+              + "\n"
+          )
           PY
 
 
       # ============================================================
       # gal 2.3.3
       #
-      # LocalSend does not normally use gallery saving on macOS.
-      # Remove PhotoKit usage entirely for High Sierra.
+      # Remove PhotoKit implementation on High Sierra.
       # ============================================================
 
       - name: Backport gal for High Sierra
@@ -436,34 +537,14 @@ jobs:
               -quit
           )"
 
-          GAL_PODSPEC="$(
-            find "$PUB_CACHE_ROOT" \
-              -type f \
-              -path '*/gal-2.3.3/darwin/gal.podspec' \
-              -print \
-              -quit
-          )"
-
-
           if [ -z "$GAL_SWIFT" ]; then
             echo "ERROR: GalPlugin.swift not found."
             exit 1
           fi
 
-          if [ -z "$GAL_PODSPEC" ]; then
-            echo "ERROR: gal.podspec not found."
-            exit 1
-          fi
-
-
           cp \
             "$GAL_SWIFT" \
             "${GAL_SWIFT}.original"
-
-          cp \
-            "$GAL_PODSPEC" \
-            "${GAL_PODSPEC}.original"
-
 
           cat > "$GAL_SWIFT" <<'SWIFT'
           import Cocoa
@@ -528,7 +609,6 @@ jobs:
           }
           SWIFT
 
-
           if grep -E \
             'import Photos|PHPhotoLibrary|PHAsset|PHFetch' \
             "$GAL_SWIFT"; then
@@ -537,378 +617,42 @@ jobs:
             exit 1
           fi
 
+          echo "gal High Sierra shim installed."
+
 
       # ============================================================
-      # NEW:
+      # connectivity_plus 7.3.1 High Sierra backport
       #
-      # Lower deployment targets in every CocoaPods-backed macOS
-      # Flutter plugin actually present in this build.
+      # Upstream:
       #
-      # CocoaPods checks podspec platform requirements BEFORE
-      # post_install, so post_install cannot solve resolver failures.
+      #   import Network
+      #   NWPathMonitor
       #
-      # Flutter's .flutter-plugins-dependencies tells us:
+      # Network.framework / NWPathMonitor requires macOS 10.14.
       #
-      #   - plugin name
-      #   - plugin path
-      #   - native_build
-      #   - shared_darwin_source
+      # Replacement:
       #
-      # Match exactly the directories Flutter's podhelper will use.
+      #   SystemConfiguration -> reachability
+      #   CoreWLAN            -> Wi-Fi interface names
+      #   getifaddrs          -> active BSD network interfaces
+      #   Dispatch timer      -> connectivity change stream
+      #
+      # Flutter MethodChannel/EventChannel API is unchanged.
       # ============================================================
 
-      - name: Backport all macOS Flutter plugin podspecs
+      - name: Backport connectivity_plus for High Sierra
         shell: bash
         run: |
           set -euxo pipefail
 
           PLUGINS_FILE="app/.flutter-plugins-dependencies"
 
-          if [ ! -f "$PLUGINS_FILE" ]; then
-            echo "ERROR: $PLUGINS_FILE does not exist."
-            exit 1
-          fi
+          test -f "$PLUGINS_FILE"
 
-
-          mkdir -p diagnostics
-
-          cp \
-            "$PLUGINS_FILE" \
-            diagnostics/flutter-plugins-dependencies.json
-
-
-          python3 <<'PY'
+          CONNECTIVITY_ROOT="$(
+            python3 <<'PY'
           import json
-          import re
-          import shutil
-
           from pathlib import Path
-
-
-          plugins_file = Path(
-              "app/.flutter-plugins-dependencies"
-          )
-
-          data = json.loads(
-              plugins_file.read_text()
-          )
-
-
-          macos_plugins = (
-              data
-              .get("plugins", {})
-              .get("macos", [])
-          )
-
-          spm_enabled = (
-              data
-              .get(
-                  "swift_package_manager_enabled",
-                  {},
-              )
-              .get("macos", False)
-          )
-
-
-          print(
-              f"macOS Flutter plugins: "
-              f"{len(macos_plugins)}"
-          )
-
-          print(
-              f"Swift Package Manager enabled: "
-              f"{spm_enabled}"
-          )
-
-          print()
-
-
-          report = []
-          patched_files = []
-
-
-          def patch_podspec(path: Path, plugin_name: str):
-              original = path.read_text()
-
-              text = original
-              changes = []
-
-
-              # ----------------------------------------------------
-              # Common form:
-              #
-              #   s.osx.deployment_target = '11.0'
-              # ----------------------------------------------------
-
-              pattern_osx_target = re.compile(
-                  r"("
-                  r"[A-Za-z_][A-Za-z0-9_]*"
-                  r"\.osx\.deployment_target"
-                  r"\s*=\s*"
-                  r")"
-                  r"(['\"])"
-                  r"([0-9.]+)"
-                  r"\2"
-              )
-
-
-              def replace_osx(match):
-                  old = match.group(3)
-
-                  if old != "10.13":
-                      changes.append(
-                          f"osx.deployment_target "
-                          f"{old} -> 10.13"
-                      )
-
-                  return (
-                      match.group(1)
-                      + match.group(2)
-                      + "10.13"
-                      + match.group(2)
-                  )
-
-
-              text = pattern_osx_target.sub(
-                  replace_osx,
-                  text,
-              )
-
-
-              # ----------------------------------------------------
-              # Alternative:
-              #
-              #   s.platform = :osx, '11.0'
-              # ----------------------------------------------------
-
-              pattern_platform = re.compile(
-                  r"("
-                  r"[A-Za-z_][A-Za-z0-9_]*"
-                  r"\.platform"
-                  r"\s*=\s*"
-                  r":osx"
-                  r"\s*,\s*"
-                  r")"
-                  r"(['\"])"
-                  r"([0-9.]+)"
-                  r"\2"
-              )
-
-
-              def replace_platform(match):
-                  old = match.group(3)
-
-                  if old != "10.13":
-                      changes.append(
-                          f"platform :osx "
-                          f"{old} -> 10.13"
-                      )
-
-                  return (
-                      match.group(1)
-                      + match.group(2)
-                      + "10.13"
-                      + match.group(2)
-                  )
-
-
-              text = pattern_platform.sub(
-                  replace_platform,
-                  text,
-              )
-
-
-              if text != original:
-
-                  backup = path.with_suffix(
-                      path.suffix + ".high-sierra-original"
-                  )
-
-                  if not backup.exists():
-                      shutil.copy2(
-                          path,
-                          backup,
-                      )
-
-                  path.write_text(text)
-
-                  patched_files.append(
-                      str(path)
-                  )
-
-
-              report.append(
-                  {
-                      "plugin": plugin_name,
-                      "podspec": str(path),
-                      "changes": changes,
-                  }
-              )
-
-
-          for plugin in macos_plugins:
-
-              name = plugin.get("name")
-              plugin_path_raw = plugin.get("path")
-
-              native_build = plugin.get(
-                  "native_build",
-                  True,
-              )
-
-              shared_darwin = plugin.get(
-                  "shared_darwin_source",
-                  False,
-              )
-
-
-              if not name or not plugin_path_raw:
-                  continue
-
-
-              if not native_build:
-
-                  print(
-                      f"[skip] {name}: "
-                      f"native_build=false"
-                  )
-
-                  continue
-
-
-              plugin_path = Path(
-                  plugin_path_raw
-              ).expanduser()
-
-
-              platform_directory = (
-                  "darwin"
-                  if shared_darwin
-                  else "macos"
-              )
-
-
-              platform_path = (
-                  plugin_path
-                  / platform_directory
-              )
-
-
-              package_swift = (
-                  platform_path
-                  / name
-                  / "Package.swift"
-              )
-
-
-              podspec = (
-                  platform_path
-                  / f"{name}.podspec"
-              )
-
-
-              print(
-                  f"{name}:"
-              )
-              print(
-                  f"  path: {plugin_path}"
-              )
-              print(
-                  f"  platform directory: "
-                  f"{platform_directory}"
-              )
-              print(
-                  f"  podspec: {podspec}"
-              )
-              print(
-                  f"  Package.swift: "
-                  f"{package_swift.exists()}"
-              )
-
-
-              # If Flutter would install this as a Pod, patch the
-              # exact podspec it will pass to CocoaPods.
-              if podspec.exists():
-
-                  patch_podspec(
-                      podspec,
-                      name,
-                  )
-
-                  print(
-                      "  podspec patched/scanned."
-                  )
-
-              else:
-
-                  print(
-                      "  no CocoaPods podspec."
-                  )
-
-              print()
-
-
-          report_path = Path(
-              "diagnostics/"
-              "plugin-podspec-backport-report.json"
-          )
-
-          report_path.write_text(
-              json.dumps(
-                  report,
-                  indent=2,
-              )
-              + "\n"
-          )
-
-
-          print(
-              "============================================================"
-          )
-          print(
-              "Patched plugin podspec files"
-          )
-          print(
-              "============================================================"
-          )
-
-          if patched_files:
-
-              for path in patched_files:
-                  print(path)
-
-          else:
-
-              print(
-                  "(No plugin podspec declarations "
-                  "needed modification.)"
-              )
-
-
-          print()
-          print(
-              f"Total scanned plugins: "
-              f"{len(macos_plugins)}"
-          )
-
-          print(
-              f"Total modified podspecs: "
-              f"{len(patched_files)}"
-          )
-          PY
-
-
-          echo
-          echo "============================================================"
-          echo "Remaining explicit macOS deployment targets in plugin cache"
-          echo "============================================================"
-
-          python3 <<'PY'
-          import json
-          import re
-
-          from pathlib import Path
-
 
           data = json.loads(
               Path(
@@ -916,79 +660,641 @@ jobs:
               ).read_text()
           )
 
-
           for plugin in (
               data
               .get("plugins", {})
               .get("macos", [])
           ):
+              if plugin.get("name") == "connectivity_plus":
+                  print(plugin["path"])
+                  break
+          PY
+          )"
 
-              name = plugin.get("name")
-              raw_path = plugin.get("path")
+          if [ -z "$CONNECTIVITY_ROOT" ]; then
+            echo "ERROR:"
+            echo "connectivity_plus is missing from the macOS plugin graph."
 
-              if not name or not raw_path:
-                  continue
+            exit 1
+          fi
 
-              if not plugin.get(
-                  "native_build",
-                  True,
-              ):
-                  continue
+          CONNECTIVITY_SOURCE="$CONNECTIVITY_ROOT/macos/connectivity_plus/Sources/connectivity_plus"
+          CONNECTIVITY_PROVIDER="$CONNECTIVITY_SOURCE/PathMonitorConnectivityProvider.swift"
+          CONNECTIVITY_PODSPEC="$CONNECTIVITY_ROOT/macos/connectivity_plus.podspec"
 
-              platform_dir = (
-                  "darwin"
-                  if plugin.get(
-                      "shared_darwin_source",
-                      False,
+          echo "============================================================"
+          echo "connectivity_plus"
+          echo "============================================================"
+
+          echo "Root:"
+          echo "$CONNECTIVITY_ROOT"
+
+          echo
+          echo "Provider:"
+          echo "$CONNECTIVITY_PROVIDER"
+
+          echo
+          echo "Podspec:"
+          echo "$CONNECTIVITY_PODSPEC"
+
+          test -f "$CONNECTIVITY_PROVIDER"
+          test -f "$CONNECTIVITY_PODSPEC"
+
+          cp \
+            "$CONNECTIVITY_PROVIDER" \
+            "${CONNECTIVITY_PROVIDER}.high-sierra-original"
+
+          cp \
+            "$CONNECTIVITY_PODSPEC" \
+            "${CONNECTIVITY_PODSPEC}.high-sierra-specific-original"
+
+
+          # --------------------------------------------------------
+          # Replace NWPathMonitor with a High Sierra provider.
+          # --------------------------------------------------------
+
+          cat > "$CONNECTIVITY_PROVIDER" <<'SWIFT'
+          import Foundation
+          import SystemConfiguration
+          import CoreWLAN
+          import Darwin
+
+          /// High Sierra implementation of connectivity_plus.
+          ///
+          /// connectivity_plus 7.3.1 normally uses NWPathMonitor,
+          /// which requires macOS 10.14 or newer.
+          ///
+          /// This implementation preserves the existing
+          /// ConnectivityProvider interface and therefore keeps the
+          /// current Flutter MethodChannel and EventChannel protocol.
+          public class PathMonitorConnectivityProvider:
+            NSObject,
+            ConnectivityProvider
+          {
+            private let queue = DispatchQueue(
+              label:
+                "dev.fluttercommunity.plus.connectivity.high-sierra"
+            )
+
+            private var timer: DispatchSourceTimer?
+
+            private var lastSignature = ""
+
+            public var connectivityUpdateHandler:
+              ConnectivityUpdateHandler?
+
+
+            override init() {
+              super.init()
+
+              lastSignature = signature(
+                for: detectConnectivityTypes()
+              )
+            }
+
+
+            deinit {
+              stop()
+            }
+
+
+            public var currentConnectivityTypes:
+              [ConnectivityType]
+            {
+              return detectConnectivityTypes()
+            }
+
+
+            public func start() {
+              if timer != nil {
+                return
+              }
+
+              let source = DispatchSource.makeTimerSource(
+                queue: queue
+              )
+
+              source.schedule(
+                deadline: .now(),
+                repeating: .seconds(2),
+                leeway: .milliseconds(250)
+              )
+
+              source.setEventHandler { [weak self] in
+                guard let self = self else {
+                  return
+                }
+
+                let current =
+                  self.detectConnectivityTypes()
+
+                let currentSignature =
+                  self.signature(
+                    for: current
                   )
-                  else "macos"
+
+                if currentSignature != self.lastSignature {
+                  self.lastSignature =
+                    currentSignature
+
+                  self.connectivityUpdateHandler?(
+                    current
+                  )
+                }
+              }
+
+              timer = source
+              source.resume()
+            }
+
+
+            public func stop() {
+              guard let source = timer else {
+                return
+              }
+
+              source.setEventHandler {}
+              source.cancel()
+
+              timer = nil
+            }
+
+
+            /// Returns connectivity types using APIs available on
+            /// macOS High Sierra.
+            ///
+            /// Reachability determines whether the machine currently
+            /// has a usable network route. Active BSD interfaces are
+            /// then classified as Wi-Fi or Ethernet.
+            private func detectConnectivityTypes()
+              -> [ConnectivityType]
+            {
+              guard isReachable() else {
+                return [.none]
+              }
+
+              let activeInterfaces =
+                activeInterfaceNames()
+
+              if activeInterfaces.isEmpty {
+                return [.other]
+              }
+
+              let wifiInterfaces =
+                wifiInterfaceNames()
+
+              var result:
+                [ConnectivityType] = []
+
+
+              if activeInterfaces.contains(
+                where: {
+                  wifiInterfaces.contains($0)
+                }
+              ) {
+                result.append(.wifi)
+              }
+
+
+              let hasEthernet =
+                activeInterfaces.contains {
+                  interfaceName in
+
+                  interfaceName.hasPrefix("en")
+                    && !wifiInterfaces.contains(
+                      interfaceName
+                    )
+                }
+
+              if hasEthernet {
+                result.append(.wiredEthernet)
+              }
+
+
+              if result.isEmpty {
+                result.append(.other)
+              }
+
+              return result
+            }
+
+
+            /// Uses SCNetworkReachability against the default IPv4
+            /// route. This API predates High Sierra by many releases.
+            private func isReachable() -> Bool {
+              var zeroAddress =
+                sockaddr_in()
+
+              zeroAddress.sin_len =
+                UInt8(
+                  MemoryLayout<
+                    sockaddr_in
+                  >.size
+                )
+
+              zeroAddress.sin_family =
+                sa_family_t(AF_INET)
+
+
+              let reachability:
+                SCNetworkReachability? =
+                withUnsafePointer(
+                  to: &zeroAddress
+                ) {
+                  pointer in
+
+                  pointer.withMemoryRebound(
+                    to: sockaddr.self,
+                    capacity: 1
+                  ) {
+                    sockaddrPointer in
+
+                    SCNetworkReachabilityCreateWithAddress(
+                      nil,
+                      sockaddrPointer
+                    )
+                  }
+                }
+
+
+              guard let target =
+                reachability
+              else {
+                return false
+              }
+
+
+              var flags =
+                SCNetworkReachabilityFlags()
+
+
+              guard SCNetworkReachabilityGetFlags(
+                target,
+                &flags
+              )
+              else {
+                return false
+              }
+
+
+              let reachable =
+                flags.contains(
+                  .reachable
+                )
+
+              let connectionRequired =
+                flags.contains(
+                  .connectionRequired
+                )
+
+              let interventionRequired =
+                flags.contains(
+                  .interventionRequired
+                )
+
+
+              return reachable
+                && !connectionRequired
+                && !interventionRequired
+            }
+
+
+            /// Returns currently active, non-loopback IPv4/IPv6
+            /// interfaces using getifaddrs().
+            private func activeInterfaceNames()
+              -> Set<String>
+            {
+              var firstAddress:
+                UnsafeMutablePointer<ifaddrs>?
+
+
+              guard getifaddrs(
+                &firstAddress
+              ) == 0,
+              let first = firstAddress
+              else {
+                return []
+              }
+
+
+              defer {
+                freeifaddrs(
+                  firstAddress
+                )
+              }
+
+
+              var result =
+                Set<String>()
+
+              var pointer:
+                UnsafeMutablePointer<ifaddrs>? =
+                first
+
+
+              while let current =
+                pointer
+              {
+                let interface =
+                  current.pointee
+
+
+                if let address =
+                  interface.ifa_addr
+                {
+                  let family =
+                    Int32(
+                      address
+                        .pointee
+                        .sa_family
+                    )
+
+                  let flags =
+                    interface.ifa_flags
+
+                  let isUp =
+                    (
+                      flags
+                      & UInt32(IFF_UP)
+                    ) != 0
+
+                  let isRunning =
+                    (
+                      flags
+                      & UInt32(IFF_RUNNING)
+                    ) != 0
+
+                  let isLoopback =
+                    (
+                      flags
+                      & UInt32(IFF_LOOPBACK)
+                    ) != 0
+
+
+                  if (
+                    family == AF_INET
+                    || family == AF_INET6
+                  )
+                    && isUp
+                    && isRunning
+                    && !isLoopback
+                  {
+                    let name =
+                      String(
+                        cString:
+                          interface.ifa_name
+                      )
+
+                    // awdl/llw are Apple peer-to-peer helper
+                    // interfaces and aren't useful as the primary
+                    // connectivity type here.
+                    if !name.hasPrefix(
+                      "awdl"
+                    )
+                      && !name.hasPrefix(
+                        "llw"
+                      )
+                    {
+                      result.insert(
+                        name
+                      )
+                    }
+                  }
+                }
+
+
+                pointer =
+                  interface.ifa_next
+              }
+
+
+              return result
+            }
+
+
+            /// Ask CoreWLAN which BSD interface names are Wi-Fi.
+            ///
+            /// CWWiFiClient exists on High Sierra and avoids assuming
+            /// that en0 is always Wi-Fi or always Ethernet.
+            private func wifiInterfaceNames()
+              -> Set<String>
+            {
+              let client =
+                CWWiFiClient.shared()
+
+
+              guard let interfaces =
+                client.interfaces()
+              else {
+                return []
+              }
+
+
+              return Set(
+                interfaces.compactMap {
+                  $0.interfaceName
+                }
+              )
+            }
+
+
+            /// ConnectivityType itself doesn't declare Equatable in
+            /// connectivity_plus 7.3.1, so create a stable textual
+            /// signature for change detection.
+            private func signature(
+              for types:
+                [ConnectivityType]
+            ) -> String
+            {
+              return types
+                .map {
+                  type in
+
+                  switch type {
+                  case .none:
+                    return "none"
+
+                  case .wiredEthernet:
+                    return "ethernet"
+
+                  case .wifi:
+                    return "wifi"
+
+                  case .cellular:
+                    return "cellular"
+
+                  case .satellite:
+                    return "satellite"
+
+                  case .other:
+                    return "other"
+                  }
+                }
+                .sorted()
+                .joined(
+                  separator: ","
+                )
+            }
+          }
+          SWIFT
+
+
+          # --------------------------------------------------------
+          # Ensure CocoaPods links the two High Sierra frameworks.
+          # --------------------------------------------------------
+
+          python3 - "$CONNECTIVITY_PODSPEC" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          framework_line = (
+              "  s.frameworks = "
+              "'SystemConfiguration', 'CoreWLAN'\n"
+          )
+
+          if "SystemConfiguration" not in text:
+              marker = (
+                  "  s.swift_version = '5.0'\n"
               )
 
-              podspec = (
-                  Path(raw_path)
-                  / platform_dir
-                  / f"{name}.podspec"
+              if marker in text:
+                  text = text.replace(
+                      marker,
+                      framework_line
+                      + marker,
+                      1,
+                  )
+              else:
+                  index = text.rfind("\nend")
+
+                  if index == -1:
+                      raise SystemExit(
+                          "ERROR: Could not patch "
+                          "connectivity_plus podspec."
+                      )
+
+                  text = (
+                      text[:index]
+                      + "\n"
+                      + framework_line
+                      + text[index:]
+                  )
+
+          path.write_text(text)
+          PY
+
+
+          echo
+          echo "============================================================"
+          echo "Patched connectivity provider"
+          echo "============================================================"
+
+          cat "$CONNECTIVITY_PROVIDER"
+
+
+          echo
+          echo "============================================================"
+          echo "Patched connectivity_plus podspec"
+          echo "============================================================"
+
+          cat "$CONNECTIVITY_PODSPEC"
+
+
+          echo
+          echo "============================================================"
+          echo "Validate Network.framework is gone"
+          echo "============================================================"
+
+          if grep -E \
+            'import Network|NWPath|NWPathMonitor' \
+            "$CONNECTIVITY_PROVIDER"; then
+
+            echo "ERROR:"
+            echo "Network.framework API remains in connectivity provider."
+
+            exit 1
+          fi
+
+
+          if ! grep -q \
+            'import SystemConfiguration' \
+            "$CONNECTIVITY_PROVIDER"; then
+
+            echo "ERROR:"
+            echo "SystemConfiguration provider was not installed."
+
+            exit 1
+          fi
+
+
+          if ! grep -q \
+            'SystemConfiguration' \
+            "$CONNECTIVITY_PODSPEC"; then
+
+            echo "ERROR:"
+            echo "SystemConfiguration is not linked in the podspec."
+
+            exit 1
+          fi
+
+
+          echo
+          echo "connectivity_plus High Sierra provider installed."
+
+
+      # ============================================================
+      # Rust / Cargokit
+      # ============================================================
+
+      - name: Prepare Cargokit
+        working-directory: packages/localsend_isolates/rust_builder/cargokit/build_tool
+        shell: bash
+        run: |
+          set -euxo pipefail
+          flutter pub get
+
+      - name: Verify Rust workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f Cargo.toml
+          test -f rust-toolchain.toml
+          test -f packages/localsend_isolates/rust/Cargo.toml
+
+          cargo metadata \
+            --format-version=1 \
+            --no-deps \
+            > /tmp/cargo-metadata.json
+
+          python3 <<'PY'
+          import json
+
+          with open(
+              "/tmp/cargo-metadata.json",
+              "r",
+          ) as file:
+              metadata = json.load(
+                  file
               )
 
-              if not podspec.exists():
-                  continue
+          print(
+              "Rust workspace packages:"
+          )
 
-              text = podspec.read_text()
-
-              matches = re.findall(
-                  r"(?:"
-                  r"\.osx\.deployment_target"
-                  r"\s*=\s*"
-                  r"['\"][0-9.]+['\"]"
-                  r"|"
-                  r"\.platform"
-                  r"\s*=\s*"
-                  r":osx"
-                  r"\s*,\s*"
-                  r"['\"][0-9.]+['\"]"
-                  r")",
-                  text,
+          for package in metadata["packages"]:
+              print(
+                  f"  {package['name']} "
+                  f"{package['version']}"
               )
 
-              if matches:
-                  print()
-                  print(podspec)
-
-                  for line in text.splitlines():
-                      if (
-                          ".osx.deployment_target"
-                          in line
-                          or (
-                              ".platform"
-                              in line
-                              and ":osx"
-                              in line
-                          )
-                      ):
-                          print(
-                              "  "
-                              + line.strip()
-                          )
+              print(
+                  f"    "
+                  f"{package['manifest_path']}"
+              )
           PY
 
 
@@ -1015,7 +1321,6 @@ jobs:
           from pathlib import Path
           import re
 
-
           path = Path(
               "app/macos/Runner.xcodeproj/project.pbxproj"
           )
@@ -1023,8 +1328,7 @@ jobs:
           text = path.read_text()
 
 
-          # Flutter migrates literal 10.13 to 10.15.
-          # Use an indirect variable instead.
+          # Flutter migrates literal macOS 10.13 entries to 10.15.
           text, count = re.subn(
               r'MACOSX_DEPLOYMENT_TARGET'
               r'\s*=\s*'
@@ -1036,12 +1340,11 @@ jobs:
 
           if count == 0:
               raise SystemExit(
-                  "ERROR: No deployment target found in pbxproj."
+                  "ERROR: No deployment targets found in pbxproj."
               )
 
 
-          # Add High Sierra/x86_64 settings to every Xcode
-          # configuration.
+          # Force all project configurations to 10.13/x86_64.
           if (
               "LOCALSEND_LEGACY_MACOS_TARGET = 10.13;"
               not in text
@@ -1065,7 +1368,7 @@ jobs:
               )
 
 
-          # Remove LocalSend upstream signing.
+          # Remove upstream Apple signing.
           text = re.sub(
               r'DEVELOPMENT_TEAM'
               r'\s*=\s*'
@@ -1152,14 +1455,14 @@ jobs:
               re.DOTALL,
           )
 
-
-          match = dock_pattern.search(text)
+          match = dock_pattern.search(
+              text
+          )
 
           if not match:
               raise SystemExit(
                   "ERROR: DockProgress package block not found."
               )
-
 
           replacement = (
               match.group(1)
@@ -1170,13 +1473,11 @@ jobs:
               + match.group(2)
           )
 
-
           text = (
               text[:match.start()]
               + replacement
               + text[match.end():]
           )
-
 
           check = re.compile(
               r'repositoryURL'
@@ -1190,12 +1491,10 @@ jobs:
               re.DOTALL,
           )
 
-
           if not check.search(text):
               raise SystemExit(
                   "ERROR: DockProgress 3.2.0 patch failed."
               )
-
 
           path.write_text(text)
           PY
@@ -1233,7 +1532,6 @@ jobs:
           from pathlib import Path
           import re
 
-
           path = Path(
               "app/macos/Podfile"
           )
@@ -1241,7 +1539,7 @@ jobs:
           text = path.read_text()
 
 
-          # Keep 10.13 indirect to evade Flutter's literal migration.
+          # Indirect variable avoids Flutter's literal 10.13 migrator.
           text, count = re.subn(
               r"^platform"
               r"\s+:osx,"
@@ -1274,7 +1572,7 @@ jobs:
 
           if count == 0:
               raise SystemExit(
-                  "ERROR: Pod post_install target patch failed."
+                  "ERROR: Pod deployment target patch failed."
               )
 
 
@@ -1283,7 +1581,6 @@ jobs:
               "['MACOSX_DEPLOYMENT_TARGET'] "
               "= legacy_macos_target"
           )
-
 
           if (
               "config.build_settings"
@@ -1335,19 +1632,17 @@ jobs:
                   1,
               )
 
-
           if "target 'ShareExtension' do" not in text:
               raise SystemExit(
                   "ERROR: ShareExtension CocoaPods target missing."
               )
-
 
           path.write_text(text)
           PY
 
 
           # --------------------------------------------------------
-          # Remove unnecessary MainActor.
+          # Remove AppDelegate @MainActor.
           # --------------------------------------------------------
 
           python3 <<'PY'
@@ -1369,7 +1664,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Remove stale SwiftPM locks.
+          # Remove stale SwiftPM resolutions.
           # --------------------------------------------------------
 
           rm -f \
@@ -1407,7 +1702,6 @@ jobs:
           PODFILE="app/macos/Podfile"
           PODHELPER="$FLUTTER_ROOT/packages/flutter_tools/bin/podhelper.rb"
 
-
           if grep -q \
             "3W7H4PYMCV" \
             "$PBX"; then
@@ -1416,63 +1710,67 @@ jobs:
             exit 1
           fi
 
-
           if grep -q \
             'MACOSX_DEPLOYMENT_TARGET = 10.13;' \
             "$PBX"; then
 
-            echo "ERROR: Literal 10.13 remains in pbxproj."
+            echo "ERROR:"
+            echo "Literal 10.13 remains in pbxproj."
+
             exit 1
           fi
-
 
           if grep -q \
             "platform :osx, '10.13'" \
             "$PODFILE"; then
 
-            echo "ERROR: Literal Podfile 10.13 would trigger Flutter migration."
+            echo "ERROR:"
+            echo "Literal Podfile target would trigger Flutter migration."
+
             exit 1
           fi
-
 
           if ! grep -q \
             "target 'ShareExtension' do" \
             "$PODFILE"; then
 
-            echo "ERROR: ShareExtension Pod target missing."
+            echo "ERROR:"
+            echo "ShareExtension Pod target missing."
+
             exit 1
           fi
-
 
           if grep -q \
             '^ *in_app_purchase:' \
             app/pubspec.yaml; then
 
-            echo "ERROR: in_app_purchase returned."
+            echo "ERROR:"
+            echo "in_app_purchase returned."
+
             exit 1
           fi
-
 
           if ! grep -q \
             "s.osx.deployment_target = '10.13'" \
             "$PODHELPER"; then
 
-            echo "ERROR: FlutterMacOS podhelper patch missing."
+            echo "ERROR:"
+            echo "FlutterMacOS podhelper patch missing."
+
             exit 1
           fi
 
-
           ruby -c "$PODFILE"
 
-          echo "Static High Sierra patch validation passed."
+          echo
+          echo "Static validation passed."
 
 
       # ============================================================
-      # First Flutter config pass.
+      # First Flutter configuration pass
       #
-      # Needed to generate Flutter-Generated.xcconfig.
-      # CocoaPods failure is allowed here because we run it explicitly
-      # with full logging next.
+      # Allow CocoaPods failure here so standalone pod install can
+      # show its complete resolver error.
       # ============================================================
 
       - name: Generate Flutter macOS configuration - first pass
@@ -1491,7 +1789,7 @@ jobs:
 
 
       # ============================================================
-      # Explicit CocoaPods install.
+      # Explicit CocoaPods install
       # ============================================================
 
       - name: Install CocoaPods dependencies explicitly
@@ -1500,24 +1798,20 @@ jobs:
         run: |
           set -euxo pipefail
 
-
           echo "============================================================"
           echo "First Flutter config outcome"
           echo "============================================================"
 
           echo "${{ steps.flutter_config_first.outcome }}"
 
-
           echo
           echo "============================================================"
           echo "Ruby / CocoaPods"
           echo "============================================================"
 
-          which ruby
           ruby --version
           which pod
           pod --version
-
 
           echo
           echo "============================================================"
@@ -1529,12 +1823,10 @@ jobs:
 
           GENERATED_XCCONFIG="Flutter/ephemeral/Flutter-Generated.xcconfig"
 
-
           if [ ! -f "$GENERATED_XCCONFIG" ]; then
 
             echo "ERROR:"
             echo "$GENERATED_XCCONFIG does not exist."
-            echo "See flutter-config-first.log."
 
             exit 1
           fi
@@ -1566,7 +1858,6 @@ jobs:
           echo "pod install --verbose"
           echo "============================================================"
 
-
           set +e
 
           pod install \
@@ -1583,9 +1874,7 @@ jobs:
           echo "Generated FlutterMacOS.podspec"
           echo "============================================================"
 
-
           FLUTTER_MACOS_PODSPEC="Flutter/ephemeral/FlutterMacOS.podspec"
-
 
           if [ -f "$FLUTTER_MACOS_PODSPEC" ]; then
             cat "$FLUTTER_MACOS_PODSPEC"
@@ -1601,26 +1890,21 @@ jobs:
             echo "CocoaPods failure summary"
             echo "============================================================"
 
-            grep -n -A12 -B4 \
+            grep -n -A15 -B5 \
               -E \
-              '^\[!\]|required a higher minimum deployment target|could not find compatible versions|ERROR|Error' \
+              '^\[!\]|higher minimum deployment target|could not find compatible versions|ERROR|Error' \
               ../../pod-install.log \
-              | tail -n 200 \
+              | tail -n 300 \
               || true
-
-            echo
-            echo "ERROR:"
-            echo "pod install failed with status $POD_STATUS."
 
             exit "$POD_STATUS"
           fi
 
 
           if [ ! -f "$FLUTTER_MACOS_PODSPEC" ]; then
-            echo "ERROR: FlutterMacOS.podspec was not generated."
+            echo "ERROR: FlutterMacOS.podspec missing."
             exit 1
           fi
-
 
           if ! grep -q \
             "s.osx.deployment_target = '10.13'" \
@@ -1632,13 +1916,12 @@ jobs:
             exit 1
           fi
 
-
           echo
           echo "CocoaPods dependency resolution succeeded."
 
 
       # ============================================================
-      # Final Flutter config pass
+      # Final Flutter configuration pass
       # ============================================================
 
       - name: Finalize Flutter macOS configuration
@@ -1655,41 +1938,28 @@ jobs:
 
 
       # ============================================================
-      # Validate generated FlutterMacOS podspec
+      # Verify StoreKit and FlutterMacOS after regeneration
       # ============================================================
 
-      - name: Verify FlutterMacOS podspec target
-        working-directory: app/macos
+      - name: Verify generated native dependency graph
+        working-directory: app
         shell: bash
         run: |
           set -euxo pipefail
 
-          PODSPEC="Flutter/ephemeral/FlutterMacOS.podspec"
+          PODSPEC="macos/Flutter/ephemeral/FlutterMacOS.podspec"
 
           test -f "$PODSPEC"
-
-          cat "$PODSPEC"
 
           if ! grep -q \
             "s.osx.deployment_target = '10.13'" \
             "$PODSPEC"; then
 
             echo "ERROR:"
-            echo "FlutterMacOS podspec is not 10.13."
+            echo "FlutterMacOS.podspec returned above 10.13."
 
             exit 1
           fi
-
-
-      # ============================================================
-      # Verify StoreKit stayed removed
-      # ============================================================
-
-      - name: Verify StoreKit plugin stayed removed
-        working-directory: app
-        shell: bash
-        run: |
-          set -euxo pipefail
 
 
           if [ -f macos/Podfile.lock ]; then
@@ -1715,7 +1985,6 @@ jobs:
               -quit
           )"
 
-
           if [ -n "$REGISTRANT" ]; then
 
             if grep -q \
@@ -1732,9 +2001,11 @@ jobs:
 
           fi
 
+          echo "Generated native dependency graph is correct."
+
 
       # ============================================================
-      # Verify migration bypass
+      # Verify Flutter project migration bypass
       # ============================================================
 
       - name: Verify Flutter migration bypass
@@ -1745,27 +2016,29 @@ jobs:
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
           PODFILE="app/macos/Podfile"
 
-
           if grep -q \
             'MACOSX_DEPLOYMENT_TARGET = 10.15;' \
             "$PBX"; then
 
-            echo "ERROR: Flutter restored pbxproj to 10.15."
+            echo "ERROR:"
+            echo "Flutter restored pbxproj to 10.15."
+
             exit 1
           fi
-
 
           if grep -q \
             "platform :osx, '10.15'" \
             "$PODFILE"; then
 
-            echo "ERROR: Flutter restored Podfile to 10.15."
+            echo "ERROR:"
+            echo "Flutter restored Podfile to 10.15."
+
             exit 1
           fi
 
 
       # ============================================================
-      # CocoaPods target verification
+      # CocoaPods integration
       # ============================================================
 
       - name: Verify CocoaPods integration
@@ -1774,14 +2047,12 @@ jobs:
         run: |
           set -euxo pipefail
 
-
           find \
             "Pods/Target Support Files" \
             -maxdepth 1 \
             -type d \
             -print \
             | sort
-
 
           if [ ! -d \
             "Pods/Target Support Files/Pods-ShareExtension" ]; then
@@ -1791,7 +2062,6 @@ jobs:
 
             exit 1
           fi
-
 
           if find \
             "Pods/Target Support Files" \
@@ -1818,7 +2088,6 @@ jobs:
 
           mkdir -p \
             build/macos/SourcePackages
-
 
           xcodebuild \
             -resolvePackageDependencies \
@@ -1854,7 +2123,6 @@ jobs:
               -quit
           )"
 
-
           if [ -n "$DOCK_DIR" ]; then
 
             echo
@@ -1880,7 +2148,7 @@ jobs:
 
 
       # ============================================================
-      # Effective Xcode build settings
+      # Effective Xcode settings
       # ============================================================
 
       - name: Verify effective Xcode build settings
@@ -1891,14 +2159,12 @@ jobs:
 
           mkdir -p ../diagnostics
 
-
           xcodebuild \
             -workspace macos/Runner.xcworkspace \
             -scheme Runner \
             -configuration Release \
             -showBuildSettings \
             > ../diagnostics/runner-build-settings.txt
-
 
           xcodebuild \
             -project macos/Runner.xcodeproj \
@@ -1933,7 +2199,6 @@ jobs:
           from pathlib import Path
           import re
 
-
           files = [
               Path(
                   "../diagnostics/"
@@ -1945,11 +2210,8 @@ jobs:
               ),
           ]
 
-
           for path in files:
-
               text = path.read_text()
-
 
               deployments = re.findall(
                   r"^\s*MACOSX_DEPLOYMENT_TARGET"
@@ -1958,14 +2220,12 @@ jobs:
                   flags=re.MULTILINE,
               )
 
-
               archs = re.findall(
                   r"^\s*ARCHS"
                   r"\s*=\s*(.*?)\s*$",
                   text,
                   flags=re.MULTILINE,
               )
-
 
               excluded = re.findall(
                   r"^\s*EXCLUDED_ARCHS"
@@ -1974,48 +2234,44 @@ jobs:
                   flags=re.MULTILINE,
               )
 
-
               print()
               print(path)
+
               print(
                   "  deployment:",
                   deployments[:3],
               )
+
               print(
                   "  ARCHS:",
                   archs[:3],
               )
+
               print(
                   "  EXCLUDED_ARCHS:",
                   excluded[:3],
               )
-
 
               if not deployments:
                   raise SystemExit(
                       f"ERROR: {path}: deployment target missing."
                   )
 
-
               if deployments[0] != "10.13":
                   raise SystemExit(
                       f"ERROR: {path}: "
-                      f"deployment target = "
-                      f"{deployments[0]!r}"
+                      f"deployment target = {deployments[0]!r}"
                   )
-
 
               if not archs:
                   raise SystemExit(
                       f"ERROR: {path}: ARCHS missing."
                   )
 
-
               if "x86_64" not in archs[0].split():
                   raise SystemExit(
                       f"ERROR: {path}: x86_64 missing."
                   )
-
 
               if (
                   excluded
@@ -2026,17 +2282,17 @@ jobs:
                       f"ERROR: {path}: arm64 not excluded."
                   )
 
-
           print()
           print("Effective build settings are correct.")
           PY
 
 
       # ============================================================
-      # Inspect Flutter engine binary before build
+      # Flutter Engine audit
       #
-      # The fake podspec being 10.13 does NOT mean the actual
-      # FlutterMacOS framework binary supports 10.13.
+      # The fake FlutterMacOS podspec now says 10.13.
+      # The actual prebuilt engine may still carry a newer Mach-O
+      # deployment target. Record it now.
       # ============================================================
 
       - name: Inspect FlutterMacOS engine
@@ -2046,16 +2302,13 @@ jobs:
 
           flutter precache --macos
 
-
           mkdir -p diagnostics
 
           REPORT="diagnostics/flutter-engine-audit-prebuild.txt"
 
           : > "$REPORT"
 
-
           ENGINE_ROOT="$FLUTTER_ROOT/bin/cache/artifacts/engine"
-
 
           for ENGINE_DIR in \
             "$ENGINE_ROOT/darwin-x64" \
@@ -2069,7 +2322,6 @@ jobs:
 
               continue
             fi
-
 
             find "$ENGINE_DIR" \
               -type f \
@@ -2141,7 +2393,7 @@ jobs:
 
 
       # ============================================================
-      # Actual application build
+      # Actual build
       # ============================================================
 
       - name: Build macOS app
@@ -2156,16 +2408,16 @@ jobs:
           echo "============================================================"
           echo "Building LocalSend"
           echo
-          echo "Target OS:       macOS High Sierra 10.13"
-          echo "Architecture:    x86_64"
-          echo "Flutter:         ${FLUTTER_VERSION}"
-          echo "Rust:            ${RUST_VERSION}"
-          echo "DockProgress:    3.2.0"
-          echo "gal:             High Sierra shim"
-          echo "StoreKit/IAP:    removed"
-          echo "Plugin podspecs: forced to 10.13"
+          echo "Target OS:          macOS High Sierra 10.13"
+          echo "Architecture:       x86_64"
+          echo "Flutter:            ${FLUTTER_VERSION}"
+          echo "Rust:               ${RUST_VERSION}"
+          echo "DockProgress:       3.2.0"
+          echo "gal:                High Sierra shim"
+          echo "StoreKit/IAP:       removed"
+          echo "Plugin podspecs:    10.13"
+          echo "connectivity_plus:  SystemConfiguration/CoreWLAN"
           echo "============================================================"
-
 
           flutter build macos \
             --release \
@@ -2185,13 +2437,11 @@ jobs:
 
           mkdir -p diagnostics
 
-
           if [ -f flutter-macos-build.log ]; then
 
             python3 <<'PY'
           from pathlib import Path
           import re
-
 
           source = Path(
               "flutter-macos-build.log"
@@ -2201,11 +2451,9 @@ jobs:
               "diagnostics/compiler-errors.txt"
           )
 
-
           lines = source.read_text(
               errors="replace"
           ).splitlines()
-
 
           pattern = re.compile(
               r"error:|"
@@ -2213,10 +2461,10 @@ jobs:
               r"is only available in macOS|"
               r"introduced in macOS|"
               r"requires macOS|"
+              r"building for macOS|"
               r"\*\* BUILD FAILED \*\*|"
               r"The following build commands failed"
           )
-
 
           hits = [
               index
@@ -2224,28 +2472,23 @@ jobs:
               if pattern.search(line)
           ]
 
-
           ranges = []
 
-
           for index in hits:
-
               start = max(
                   0,
-                  index - 10,
+                  index - 12,
               )
 
               end = min(
                   len(lines),
-                  index + 14,
+                  index + 16,
               )
-
 
               if (
                   ranges
                   and start <= ranges[-1][1]
               ):
-
                   ranges[-1] = (
                       ranges[-1][0],
                       max(
@@ -2253,19 +2496,14 @@ jobs:
                           end,
                       ),
                   )
-
               else:
-
                   ranges.append(
                       (start, end)
                   )
 
-
           output_lines = []
 
-
           for start, end in ranges:
-
               output_lines.append(
                   "=" * 80
               )
@@ -2274,12 +2512,10 @@ jobs:
                   start,
                   end,
               ):
-
                   output_lines.append(
                       f"{index + 1}: "
                       f"{lines[index]}"
                   )
-
 
           output.write_text(
               "\n".join(output_lines)
@@ -2290,19 +2526,17 @@ jobs:
               )
           )
 
-
-          print(
-              output.read_text()
-              if output.exists()
-              else ""
-          )
+          if output.exists():
+              print(
+                  output.read_text()
+              )
           PY
 
           fi
 
 
       # ============================================================
-      # Locate built application
+      # Locate built app
       # ============================================================
 
       - name: Locate built application
@@ -2310,7 +2544,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
 
           APP="$(
             find \
@@ -2322,7 +2555,6 @@ jobs:
               -quit
           )"
 
-
           if [ -z "$APP" ]; then
 
             echo "ERROR:"
@@ -2331,13 +2563,11 @@ jobs:
             exit 1
           fi
 
-
           EXECUTABLE="$(
             /usr/libexec/PlistBuddy \
               -c 'Print :CFBundleExecutable' \
               "$APP/Contents/Info.plist"
           )"
-
 
           echo \
             "APP=$APP" \
@@ -2347,13 +2577,12 @@ jobs:
             "APP_EXECUTABLE=$EXECUTABLE" \
             >> "$GITHUB_ENV"
 
-
           echo "APP=$APP"
           echo "EXECUTABLE=$EXECUTABLE"
 
 
       # ============================================================
-      # Architecture
+      # Main binary architecture
       # ============================================================
 
       - name: Verify x86_64 application
@@ -2378,25 +2607,27 @@ jobs:
 
           echo "Architectures: $ARCHES"
 
-
           if ! echo "$ARCHES" \
             | grep -qw x86_64; then
 
-            echo "ERROR: Main executable lacks x86_64."
+            echo "ERROR:"
+            echo "Main executable lacks x86_64."
+
             exit 1
           fi
-
 
           if echo "$ARCHES" \
             | grep -qw arm64; then
 
-            echo "ERROR: arm64 unexpectedly remains."
+            echo "ERROR:"
+            echo "arm64 unexpectedly remains."
+
             exit 1
           fi
 
 
       # ============================================================
-      # Audit every built Mach-O
+      # Audit all built Mach-O binaries
       # ============================================================
 
       - name: Audit Mach-O deployment targets
@@ -2410,7 +2641,6 @@ jobs:
           REPORT="../diagnostics/macho-deployment-targets.txt"
 
           : > "$REPORT"
-
 
           find "$APP" \
             -type f \
@@ -2480,7 +2710,7 @@ jobs:
 
 
       # ============================================================
-      # Code signing
+      # Signatures
       # ============================================================
 
       - name: Inspect code signatures
@@ -2492,7 +2722,6 @@ jobs:
           mkdir -p ../diagnostics
 
           REPORT="../diagnostics/codesign-report.txt"
-
 
           {
             echo "============================================================"
@@ -2550,7 +2779,6 @@ jobs:
 
           } | tee "$REPORT"
 
-
           codesign \
             --verify \
             --deep \
@@ -2587,7 +2815,7 @@ jobs:
 
 
       # ============================================================
-      # Build artifact
+      # Successful build artifact
       # ============================================================
 
       - name: Upload High Sierra build
@@ -2600,7 +2828,7 @@ jobs:
 
 
       # ============================================================
-      # Diagnostics
+      # Diagnostics — always
       # ============================================================
 
       - name: Collect diagnostics
@@ -2699,22 +2927,25 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Package.resolved files
+          # SwiftPM resolutions
           # --------------------------------------------------------
 
           python3 <<'PY'
           from pathlib import Path
           import shutil
 
+          source = Path(
+              "app/macos"
+          )
 
-          source = Path("app/macos")
-          destination = Path("diagnostics")
+          destination = Path(
+              "diagnostics"
+          )
 
           destination.mkdir(
               parents=True,
               exist_ok=True,
           )
-
 
           files = sorted(
               path
@@ -2724,12 +2955,10 @@ jobs:
               if path.parent.name == "swiftpm"
           )
 
-
           for index, path in enumerate(
               files,
               start=1,
           ):
-
               relative = path.relative_to(
                   source
               )
@@ -2750,24 +2979,17 @@ jobs:
                   path,
                   output,
               )
-
-              print(
-                  f"Copied {path} -> {output}"
-              )
           PY
 
 
           # --------------------------------------------------------
-          # Collect every modified Flutter plugin podspec and its
-          # original backup.
+          # Collect patched plugin podspecs
           # --------------------------------------------------------
 
           python3 <<'PY'
           import json
           import shutil
-
           from pathlib import Path
-
 
           plugins_file = Path(
               "app/.flutter-plugins-dependencies"
@@ -2782,7 +3004,6 @@ jobs:
               exist_ok=True,
           )
 
-
           if plugins_file.exists():
 
               data = json.loads(
@@ -2794,7 +3015,6 @@ jobs:
                   .get("plugins", {})
                   .get("macos", [])
               ):
-
                   name = plugin.get("name")
                   raw_path = plugin.get("path")
 
@@ -2817,7 +3037,6 @@ jobs:
                   )
 
                   if podspec.exists():
-
                       shutil.copy2(
                           podspec,
                           destination
@@ -2830,13 +3049,75 @@ jobs:
                   )
 
                   if backup.exists():
-
                       shutil.copy2(
                           backup,
                           destination
                           / f"{name}.podspec.original",
                       )
           PY
+
+
+          # --------------------------------------------------------
+          # connectivity_plus sources
+          # --------------------------------------------------------
+
+          CONNECTIVITY_ROOT="$(
+            python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(
+              "app/.flutter-plugins-dependencies"
+          )
+
+          if path.exists():
+              data = json.loads(
+                  path.read_text()
+              )
+
+              for plugin in (
+                  data
+                  .get("plugins", {})
+                  .get("macos", [])
+              ):
+                  if plugin.get("name") == "connectivity_plus":
+                      print(
+                          plugin.get(
+                              "path",
+                              "",
+                          )
+                      )
+                      break
+          PY
+          )"
+
+          if [ -n "$CONNECTIVITY_ROOT" ]; then
+
+            CONNECTIVITY_PROVIDER="$CONNECTIVITY_ROOT/macos/connectivity_plus/Sources/connectivity_plus/PathMonitorConnectivityProvider.swift"
+
+            CONNECTIVITY_PODSPEC="$CONNECTIVITY_ROOT/macos/connectivity_plus.podspec"
+
+            cp \
+              "$CONNECTIVITY_PROVIDER" \
+              diagnostics/ConnectivityProvider.high-sierra.swift \
+              2>/dev/null
+
+            cp \
+              "${CONNECTIVITY_PROVIDER}.high-sierra-original" \
+              diagnostics/ConnectivityProvider.original.swift \
+              2>/dev/null
+
+            cp \
+              "$CONNECTIVITY_PODSPEC" \
+              diagnostics/connectivity_plus.podspec.after-patch \
+              2>/dev/null
+
+            cp \
+              "${CONNECTIVITY_PODSPEC}.high-sierra-specific-original" \
+              diagnostics/connectivity_plus.podspec.before-specific-patch \
+              2>/dev/null
+
+          fi
 
 
           # --------------------------------------------------------
