@@ -50,10 +50,8 @@ jobs:
 
 
       # ============================================================
-      # FlutterMacOS fake CocoaPods spec
-      #
-      # Flutter 3.41.9 generates FlutterMacOS.podspec with 10.15.
-      # Patch the generator so every regeneration produces 10.13.
+      # Flutter 3.41.9 generates FlutterMacOS.podspec with macOS 10.15.
+      # Patch the generator itself so every regeneration uses 10.13.
       # ============================================================
 
       - name: Backport FlutterMacOS podspec generator
@@ -181,9 +179,7 @@ jobs:
 
 
       # ============================================================
-      # Remove StoreKit / in_app_purchase
-      #
-      # Use LocalSend's FOSS-removal markers.
+      # Remove StoreKit / in_app_purchase using LocalSend's FOSS path.
       # ============================================================
 
       - name: Remove in-app purchases for High Sierra
@@ -320,7 +316,7 @@ jobs:
 
 
       # ============================================================
-      # Verify StoreKit removal
+      # Verify StoreKit is absent
       # ============================================================
 
       - name: Verify in-app purchase plugin is gone
@@ -364,11 +360,11 @@ jobs:
 
 
       # ============================================================
-      # Lower CocoaPods-backed Flutter plugin podspec declarations
-      # to 10.13.
+      # Lower all CocoaPods-backed Flutter macOS plugin declarations
+      # to macOS 10.13.
       #
-      # This bypasses resolver declarations only.
-      # Actual API compatibility is handled separately.
+      # This only bypasses podspec minimum-version declarations.
+      # Actual API incompatibilities are handled separately.
       # ============================================================
 
       - name: Backport macOS Flutter plugin podspecs
@@ -442,6 +438,7 @@ jobs:
                       "podspec": None,
                       "status": "no podspec",
                   })
+
                   continue
 
               original = podspec.read_text()
@@ -487,9 +484,7 @@ jobs:
                           backup,
                       )
 
-                  podspec.write_text(
-                      text
-                  )
+                  podspec.write_text(text)
 
                   status = "patched"
               else:
@@ -519,7 +514,7 @@ jobs:
 
 
       # ============================================================
-      # gal High Sierra shim
+      # gal 2.3.3 High Sierra shim
       # ============================================================
 
       - name: Backport gal for High Sierra
@@ -538,8 +533,10 @@ jobs:
           )"
 
           if [ -z "$GAL_SWIFT" ]; then
+
             echo "ERROR:"
             echo "GalPlugin.swift not found."
+
             exit 1
           fi
 
@@ -551,27 +548,38 @@ jobs:
           import Cocoa
           import FlutterMacOS
 
-          public class GalPlugin: NSObject, FlutterPlugin {
-
+          public class GalPlugin:
+            NSObject,
+            FlutterPlugin
+          {
             public static func register(
-              with registrar: FlutterPluginRegistrar
+              with registrar:
+                FlutterPluginRegistrar
             ) {
-              let channel = FlutterMethodChannel(
-                name: "gal",
-                binaryMessenger: registrar.messenger
-              )
+              let channel =
+                FlutterMethodChannel(
+                  name: "gal",
+                  binaryMessenger:
+                    registrar.messenger
+                )
 
-              let instance = GalPlugin()
+              let instance =
+                GalPlugin()
 
-              registrar.addMethodCallDelegate(
-                instance,
-                channel: channel
-              )
+              registrar
+                .addMethodCallDelegate(
+                  instance,
+                  channel: channel
+                )
             }
 
+
             public func handle(
-              _ call: FlutterMethodCall,
-              result: @escaping FlutterResult
+              _ call:
+                FlutterMethodCall,
+              result:
+                @escaping
+                FlutterResult
             ) {
               switch call.method {
 
@@ -587,27 +595,36 @@ jobs:
 
                 result(
                   FlutterError(
-                    code: "ACCESS_DENIED",
+                    code:
+                      "ACCESS_DENIED",
                     message:
                       "Direct Photos-library saving is unavailable "
                       + "in the macOS High Sierra build.",
-                    details: nil
+                    details:
+                      nil
                   )
                 )
 
               case "open":
 
-                if let url = URL(
-                  string: "photos://"
-                ) {
-                  _ = NSWorkspace.shared.open(
-                    url
+                if let url =
+                  URL(
+                    string:
+                      "photos://"
                   )
+                {
+                  _ =
+                    NSWorkspace
+                      .shared
+                      .open(
+                        url
+                      )
                 }
 
                 result(nil)
 
               default:
+
                 result(
                   FlutterMethodNotImplemented
                 )
@@ -633,10 +650,9 @@ jobs:
       # connectivity_plus 7.3.1
       #
       # Replace Network.framework / NWPathMonitor with:
-      #
       # - SystemConfiguration
       # - CoreWLAN
-      # - getifaddrs
+      # - getifaddrs()
       # - DispatchSourceTimer
       # ============================================================
 
@@ -644,10 +660,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
-          PLUGINS_FILE="app/.flutter-plugins-dependencies"
-
-          test -f "$PLUGINS_FILE"
 
           CONNECTIVITY_ROOT="$(
             python3 <<'PY'
@@ -672,8 +684,10 @@ jobs:
           )"
 
           if [ -z "$CONNECTIVITY_ROOT" ]; then
+
             echo "ERROR:"
             echo "connectivity_plus missing from plugin graph."
+
             exit 1
           fi
 
@@ -723,10 +737,11 @@ jobs:
             override init() {
               super.init()
 
-              lastSignature = signature(
-                for:
-                  detectConnectivityTypes()
-              )
+              lastSignature =
+                signature(
+                  for:
+                    detectConnectivityTypes()
+                )
             }
 
 
@@ -748,13 +763,17 @@ jobs:
               }
 
               let source =
-                DispatchSource.makeTimerSource(
-                  queue: queue
-                )
+                DispatchSource
+                  .makeTimerSource(
+                    queue:
+                      queue
+                  )
 
               source.schedule(
-                deadline: .now(),
-                repeating: .seconds(2),
+                deadline:
+                  .now(),
+                repeating:
+                  .seconds(2),
                 leeway:
                   .milliseconds(250)
               )
@@ -769,12 +788,15 @@ jobs:
                 }
 
                 let current =
-                  self.detectConnectivityTypes()
+                  self
+                    .detectConnectivityTypes()
 
                 let currentSignature =
-                  self.signature(
-                    for: current
-                  )
+                  self
+                    .signature(
+                      for:
+                        current
+                    )
 
                 if (
                   currentSignature
@@ -783,13 +805,15 @@ jobs:
                   self.lastSignature =
                     currentSignature
 
-                  self.connectivityUpdateHandler?(
-                    current
-                  )
+                  self
+                    .connectivityUpdateHandler?(
+                      current
+                    )
                 }
               }
 
-              timer = source
+              timer =
+                source
 
               source.resume()
             }
@@ -806,7 +830,8 @@ jobs:
 
               source.cancel()
 
-              timer = nil
+              timer =
+                nil
             }
 
 
@@ -832,7 +857,9 @@ jobs:
 
               if active.contains(
                 where: {
-                  wifi.contains($0)
+                  wifi.contains(
+                    $0
+                  )
                 }
               ) {
                 result.append(
@@ -888,21 +915,25 @@ jobs:
               let reachability:
                 SCNetworkReachability? =
                 withUnsafePointer(
-                  to: &zeroAddress
+                  to:
+                    &zeroAddress
                 ) {
                   pointer in
 
-                  pointer.withMemoryRebound(
-                    to: sockaddr.self,
-                    capacity: 1
-                  ) {
-                    address in
+                  pointer
+                    .withMemoryRebound(
+                      to:
+                        sockaddr.self,
+                      capacity:
+                        1
+                    ) {
+                      address in
 
-                    SCNetworkReachabilityCreateWithAddress(
-                      nil,
-                      address
-                    )
-                  }
+                      SCNetworkReachabilityCreateWithAddress(
+                        nil,
+                        address
+                      )
+                    }
                 }
 
               guard let target =
@@ -1053,7 +1084,8 @@ jobs:
                 }
 
                 pointer =
-                  interface.ifa_next
+                  interface
+                    .ifa_next
               }
 
               return result
@@ -1073,11 +1105,13 @@ jobs:
               }
 
               return Set(
-                interfaces.compactMap {
-                  interface in
+                interfaces
+                  .compactMap {
+                    interface in
 
-                  interface.interfaceName
-                }
+                    interface
+                      .interfaceName
+                  }
               )
             }
 
@@ -1114,7 +1148,8 @@ jobs:
                 }
                 .sorted()
                 .joined(
-                  separator: ","
+                  separator:
+                    ","
                 )
             }
           }
@@ -1172,8 +1207,7 @@ jobs:
           PY
 
 
-          # Validate actual executable Swift code,
-          # not comments containing words such as NWPathMonitor.
+          # Validate actual code, ignoring comments.
 
           python3 - "$CONNECTIVITY_PROVIDER" <<'PY'
           import re
@@ -1215,17 +1249,18 @@ jobs:
                   pattern,
                   code,
               ):
-                  found.append(name)
+                  found.append(
+                      name
+                  )
 
           if found:
               print(
-                  "ERROR: Network.framework "
-                  "code remains:"
+                  "ERROR: Network.framework code remains:"
               )
 
-              for item in found:
+              for name in found:
                   print(
-                      f"  {item}"
+                      f"  {name}"
                   )
 
               raise SystemExit(1)
@@ -1248,24 +1283,26 @@ jobs:
                   pattern,
                   code,
               ):
-                  missing.append(name)
+                  missing.append(
+                      name
+                  )
 
           if missing:
               print(
                   "ERROR: High Sierra connectivity "
-                  "provider is incomplete:"
+                  "provider incomplete:"
               )
 
-              for item in missing:
+              for name in missing:
                   print(
-                      f"  missing {item}"
+                      f"  missing {name}"
                   )
 
               raise SystemExit(1)
 
           print(
               "connectivity_plus High Sierra "
-              "source validation passed."
+              "validation passed."
           )
           PY
 
@@ -1315,8 +1352,10 @@ jobs:
                   f"  {package['name']} "
                   f"{package['version']}"
               )
+
               print(
-                  f"    {package['manifest_path']}"
+                  f"    "
+                  f"{package['manifest_path']}"
               )
           PY
 
@@ -1331,7 +1370,9 @@ jobs:
           set -euxo pipefail
 
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
+
           PODFILE="app/macos/Podfile"
+
           RELEASE_XCCONFIG="app/macos/Runner/Configs/Release.xcconfig"
 
 
@@ -1444,7 +1485,9 @@ jobs:
           )
 
 
-          # DockProgress -> 3.2.0
+          # --------------------------------------------------------
+          # DockProgress 4.x -> exact 3.2.0
+          # --------------------------------------------------------
 
           dock_pattern = re.compile(
               r'('
@@ -1710,21 +1753,14 @@ jobs:
       # ShareExtension High Sierra backport
       #
       # Remove:
-      #
       # - SwiftUI
       # - UniformTypeIdentifiers / UTType
       # - Task
-      # - async / await
+      # - Swift async/await
       # - withCheckedThrowingContinuation
-      # - NSWorkspace.OpenConfiguration
+      # - modern NSWorkspace.OpenConfiguration
       #
-      # Replace with:
-      #
-      # - AppKit
-      # - legacy UTI string "public.url"
-      # - NSItemProvider callback API
-      # - DispatchGroup
-      # - NSWorkspace.open(URL)
+      # Keep normal Grand Central Dispatch `.async {}`.
       # ============================================================
 
       - name: Backport ShareExtension for High Sierra
@@ -1733,11 +1769,11 @@ jobs:
           set -euxo pipefail
 
           UTILITIES="app/macos/ShareExtension/Utilities.swift"
+
           SHARE_CONTROLLER="app/macos/ShareExtension/ShareController.swift"
 
           test -f "$UTILITIES"
           test -f "$SHARE_CONTROLLER"
-
 
           cp \
             "$UTILITIES" \
@@ -1757,15 +1793,23 @@ jobs:
           import Foundation
 
           extension Sequence where Element: Sequence {
-            func flatten() -> [Element.Element] {
-              return flatMap { $0 }
+
+            func flatten()
+              -> [Element.Element]
+            {
+              return flatMap {
+                $0
+              }
             }
           }
 
 
           struct TextContent {
-            var title: String?
-            var body: String?
+            var title:
+              String?
+
+            var body:
+              String?
           }
 
 
@@ -1835,9 +1879,11 @@ jobs:
             NSViewController
           {
             override func loadView() {
-              view = NSView(
-                frame: .zero
-              )
+              view =
+                NSView(
+                  frame:
+                    .zero
+                )
 
               guard let context =
                 extensionContext
@@ -1851,26 +1897,30 @@ jobs:
                 items,
                 error in
 
-                DispatchQueue.main.async {
+                DispatchQueue
+                  .main
+                  .async {
 
-                  if let error =
-                    error
-                  {
-                    context.cancelRequest(
-                      withError:
-                        error
-                    )
+                    if let error =
+                      error
+                    {
+                      context
+                        .cancelRequest(
+                          withError:
+                            error
+                        )
 
-                    return
+                      return
+                    }
+
+                    context
+                      .completeRequest(
+                        returningItems:
+                          items,
+                        completionHandler:
+                          nil
+                      )
                   }
-
-                  context.completeRequest(
-                    returningItems:
-                      items,
-                    completionHandler:
-                      nil
-                  )
-                }
               }
             }
 
@@ -1901,7 +1951,8 @@ jobs:
               .contains {
                 application in
 
-                application.bundleURL
+                application
+                  .bundleURL
                   == url
               }
           }
@@ -1912,7 +1963,8 @@ jobs:
               URL
           ) {
             guard !isAppRunning(
-              at: appURL
+              at:
+                appURL
             )
             else {
               return
@@ -2038,7 +2090,8 @@ jobs:
 
                   guard let url =
                     self.url(
-                      from: item
+                      from:
+                        item
                     )
                   else {
                     print(
@@ -2067,7 +2120,8 @@ jobs:
 
 
               group.notify(
-                queue: .main
+                queue:
+                  .main
               ) {
                 lock.lock()
 
@@ -2110,7 +2164,8 @@ jobs:
                       url in
 
                       createBookmarkForFile(
-                        at: url
+                        at:
+                          url
                       )
                     }
 
@@ -2167,7 +2222,8 @@ jobs:
               if let value =
                 item as? NSURL
               {
-                return value as URL
+                return value
+                  as URL
               }
 
 
@@ -2226,7 +2282,6 @@ jobs:
 
           cat "$UTILITIES"
 
-
           echo
           echo "============================================================"
           echo "ShareController.swift after High Sierra patch"
@@ -2236,7 +2291,18 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Validate executable code after removing comments.
+          # Validate actual Swift code.
+          #
+          # IMPORTANT:
+          # Do NOT reject every token named "async".
+          #
+          # DispatchQueue.main.async { ... } is valid GCD.
+          #
+          # We only reject actual Swift Concurrency constructs:
+          #
+          #   func foo() async
+          #   await ...
+          #   Task { ... }
           # --------------------------------------------------------
 
           python3 - \
@@ -2247,11 +2313,7 @@ jobs:
           from pathlib import Path
 
 
-          def uncommented(path):
-              source = Path(
-                  path
-              ).read_text()
-
+          def strip_comments(source):
               source = re.sub(
                   r"/\*.*?\*/",
                   "",
@@ -2269,7 +2331,9 @@ jobs:
 
 
           code = "\n".join(
-              uncommented(path)
+              strip_comments(
+                  Path(path).read_text()
+              )
               for path in sys.argv[1:]
           )
 
@@ -2287,40 +2351,46 @@ jobs:
               "Task":
                   r"\bTask\b",
 
-              "async":
-                  r"\basync\b",
-
               "await":
                   r"\bawait\b",
+
+              "async function declaration":
+                  r"\)\s*async(?:\s+throws)?\b",
 
               "withCheckedThrowingContinuation":
                   r"\bwithCheckedThrowingContinuation\b",
 
               "NSWorkspace.OpenConfiguration":
                   r"\bNSWorkspace\.OpenConfiguration\b",
+
+              "NSWorkspace.openApplication(configuration:)":
+                  r"\bopenApplication\s*\(",
           }
 
 
-          errors = []
+          found = []
 
 
           for name, pattern in forbidden.items():
+
               if re.search(
                   pattern,
                   code,
+                  flags=re.DOTALL,
               ):
-                  errors.append(
+                  found.append(
                       name
                   )
 
 
-          if errors:
+          if found:
+
               print(
-                  "ERROR: Modern API remains "
-                  "in ShareExtension:"
+                  "ERROR: Modern ShareExtension "
+                  "API remains:"
               )
 
-              for name in errors:
+              for name in found:
                   print(
                       f"  {name}"
                   )
@@ -2334,14 +2404,21 @@ jobs:
               "AppKit":
                   r"(?m)^\s*import\s+AppKit\s*$",
 
-              "legacy UTI":
+              "legacy URL UTI":
                   r'"public\.url"',
 
-              "legacy NSItemProvider callback":
+              "NSItemProvider callback API":
                   r"\.loadItem\s*\(",
 
+              "DispatchQueue main async":
+                  r"DispatchQueue\s*"
+                  r"\.\s*main\s*"
+                  r"\.\s*async\s*\{",
+
               "NSWorkspace.open":
-                  r"\.open\s*\(",
+                  r"NSWorkspace\s*"
+                  r"\.\s*shared\s*"
+                  r"\.\s*open\s*\(",
           }
 
 
@@ -2349,9 +2426,11 @@ jobs:
 
 
           for name, pattern in required.items():
+
               if not re.search(
                   pattern,
                   code,
+                  flags=re.DOTALL,
               ):
                   missing.append(
                       name
@@ -2359,9 +2438,10 @@ jobs:
 
 
           if missing:
+
               print(
                   "ERROR: ShareExtension "
-                  "compatibility patch incomplete:"
+                  "High Sierra patch incomplete:"
               )
 
               for name in missing:
@@ -2375,7 +2455,17 @@ jobs:
 
 
           print(
-              "ShareExtension High Sierra "
+              "PASS: ShareExtension has no "
+              "Swift Concurrency dependency."
+          )
+
+          print(
+              "PASS: DispatchQueue.main.async "
+              "is retained as normal GCD."
+          )
+
+          print(
+              "PASS: ShareExtension High Sierra "
               "source validation passed."
           )
           PY
@@ -2391,6 +2481,7 @@ jobs:
           set -euxo pipefail
 
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
+
           PODFILE="app/macos/Podfile"
 
           PODHELPER="$FLUTTER_ROOT/packages/flutter_tools/bin/podhelper.rb"
@@ -2472,7 +2563,10 @@ jobs:
 
 
       # ============================================================
-      # First Flutter configuration pass
+      # First Flutter native-config pass.
+      #
+      # Allow CocoaPods failure here so the standalone pod install
+      # below can print the actual resolver error.
       # ============================================================
 
       - name: Generate Flutter macOS configuration - first pass
@@ -2513,7 +2607,9 @@ jobs:
           echo "============================================================"
 
           ruby --version
+
           which pod
+
           pod --version
 
 
@@ -2567,13 +2663,17 @@ jobs:
           echo "pod install --verbose"
           echo "============================================================"
 
+
           set +e
+
 
           pod install \
             --verbose \
             2>&1 | tee ../../pod-install.log
 
+
           POD_STATUS="${PIPESTATUS[0]}"
+
 
           set -e
 
@@ -2583,12 +2683,18 @@ jobs:
           echo "Generated FlutterMacOS.podspec"
           echo "============================================================"
 
+
           FLUTTER_MACOS_PODSPEC="Flutter/ephemeral/FlutterMacOS.podspec"
 
+
           if [ -f "$FLUTTER_MACOS_PODSPEC" ]; then
+
             cat "$FLUTTER_MACOS_PODSPEC"
+
           else
+
             echo "(not generated)"
+
           fi
 
 
@@ -2636,7 +2742,7 @@ jobs:
 
 
       # ============================================================
-      # Final Flutter configuration pass
+      # Final Flutter native-config pass
       # ============================================================
 
       - name: Finalize Flutter macOS configuration
@@ -2653,7 +2759,7 @@ jobs:
 
 
       # ============================================================
-      # Generated graph validation
+      # Verify generated native dependency graph
       # ============================================================
 
       - name: Verify generated native dependency graph
@@ -2725,7 +2831,7 @@ jobs:
 
 
       # ============================================================
-      # Verify migration bypass
+      # Flutter migration validation
       # ============================================================
 
       - name: Verify Flutter migration bypass
@@ -2734,6 +2840,7 @@ jobs:
           set -euxo pipefail
 
           PBX="app/macos/Runner.xcodeproj/project.pbxproj"
+
           PODFILE="app/macos/Podfile"
 
 
@@ -2965,14 +3072,17 @@ jobs:
 
               print()
               print(path)
+
               print(
                   "  deployment:",
                   deployments[:3],
               )
+
               print(
                   "  ARCHS:",
                   archs[:3],
               )
+
               print(
                   "  EXCLUDED_ARCHS:",
                   excluded[:3],
@@ -3018,7 +3128,10 @@ jobs:
 
 
       # ============================================================
-      # Flutter engine audit
+      # Flutter Engine audit before build.
+      #
+      # The fake FlutterMacOS podspec being 10.13 does not prove
+      # that the actual engine binary has a 10.13 minimum OS.
       # ============================================================
 
       - name: Inspect FlutterMacOS engine
@@ -3146,7 +3259,7 @@ jobs:
           echo "StoreKit/IAP:       removed"
           echo "Plugin podspecs:    10.13"
           echo "connectivity_plus:  SystemConfiguration/CoreWLAN"
-          echo "ShareExtension:     High Sierra callback implementation"
+          echo "ShareExtension:     callback/GCD High Sierra implementation"
           echo "============================================================"
 
 
@@ -3159,10 +3272,7 @@ jobs:
       # ============================================================
       # Compiler diagnostics
       #
-      # IMPORTANT:
-      # Availability warnings are deliberately separated from real
-      # compiler/linker errors so photo_manager warnings do not bury
-      # the actual blocker again.
+      # Real errors and availability warnings are separated.
       # ============================================================
 
       - name: Extract compiler errors
@@ -3181,7 +3291,6 @@ jobs:
           from pathlib import Path
           import re
 
-
           source = Path(
               "flutter-macos-build.log"
           )
@@ -3191,50 +3300,53 @@ jobs:
           ).splitlines()
 
 
-          # --------------------------------------------------------
-          # Real errors
-          # --------------------------------------------------------
-
-          primary_patterns = [
-              r"\berror:",
-              r"\bfatal error:",
-              r"Undefined symbols for architecture",
-              r"symbol\(s\) not found for architecture",
-              r"ld: ",
-              r"clang: error:",
-              r"Command .* failed with a nonzero exit code",
-              r"PhaseScriptExecution .* failed",
-              r"\*\* BUILD FAILED \*\*",
-              r"The following build commands failed:",
-          ]
-
-
-          primary = re.compile(
-              "|".join(
-                  primary_patterns
-              )
+          real_error_pattern = re.compile(
+              r"(?:"
+              r"\berror:"
+              r"|"
+              r"\bfatal error:"
+              r"|"
+              r"Undefined symbols for architecture"
+              r"|"
+              r"symbol\(s\) not found for architecture"
+              r"|"
+              r"ld: "
+              r"|"
+              r"clang: error:"
+              r"|"
+              r"Command .* failed with a nonzero exit code"
+              r"|"
+              r"PhaseScriptExecution .* failed"
+              r"|"
+              r"\*\* BUILD FAILED \*\*"
+              r"|"
+              r"The following build commands failed:"
+              r")"
           )
 
 
-          hit_indexes = [
+          hits = [
               index
               for index, line in enumerate(lines)
-              if primary.search(line)
+              if real_error_pattern.search(
+                  line
+              )
           ]
 
 
           ranges = []
 
 
-          for index in hit_indexes:
+          for index in hits:
+
               start = max(
                   0,
-                  index - 16,
+                  index - 18,
               )
 
               end = min(
                   len(lines),
-                  index + 22,
+                  index + 26,
               )
 
               if (
@@ -3258,6 +3370,7 @@ jobs:
 
 
           for start, end in ranges:
+
               output.append(
                   "=" * 100
               )
@@ -3273,7 +3386,8 @@ jobs:
 
 
           Path(
-              "diagnostics/compiler-errors.txt"
+              "diagnostics/"
+              "compiler-errors.txt"
           ).write_text(
               "\n".join(output)
               + (
@@ -3283,12 +3397,6 @@ jobs:
               )
           )
 
-
-          # --------------------------------------------------------
-          # Availability warnings / notes separately
-          # --------------------------------------------------------
-
-          availability = []
 
           availability_pattern = re.compile(
               r"(?:"
@@ -3301,14 +3409,13 @@ jobs:
           )
 
 
-          for index, line in enumerate(lines):
+          availability = [
+              f"{index + 1}: {line}"
+              for index, line in enumerate(lines)
               if availability_pattern.search(
                   line
-              ):
-                  availability.append(
-                      f"{index + 1}: "
-                      f"{line}"
-                  )
+              )
+          ]
 
 
           Path(
@@ -3326,20 +3433,17 @@ jobs:
           )
 
 
-          # --------------------------------------------------------
-          # Always preserve the end of the complete build.
-          # --------------------------------------------------------
-
           tail = lines[
               max(
                   0,
-                  len(lines) - 1200,
+                  len(lines) - 1500,
               ):
           ]
 
 
           Path(
-              "diagnostics/build-tail.txt"
+              "diagnostics/"
+              "build-tail.txt"
           ).write_text(
               "\n".join(
                   tail
@@ -3351,16 +3455,19 @@ jobs:
           print(
               "============================================================"
           )
+
           print(
               "REAL COMPILER / LINKER ERRORS"
           )
+
           print(
               "============================================================"
           )
 
 
           error_file = Path(
-              "diagnostics/compiler-errors.txt"
+              "diagnostics/"
+              "compiler-errors.txt"
           )
 
 
@@ -3373,7 +3480,8 @@ jobs:
               )
           else:
               print(
-                  "No explicit error line was found."
+                  "No explicit compiler/linker error "
+                  "was matched."
               )
 
               print(
@@ -3385,7 +3493,7 @@ jobs:
 
 
       # ============================================================
-      # Locate built application
+      # Locate built app
       # ============================================================
 
       - name: Locate built application
@@ -3432,11 +3540,12 @@ jobs:
 
 
           echo "APP=$APP"
+
           echo "EXECUTABLE=$EXECUTABLE"
 
 
       # ============================================================
-      # Main architecture
+      # Verify x86_64 main executable
       # ============================================================
 
       - name: Verify x86_64 application
@@ -3458,6 +3567,7 @@ jobs:
               -archs \
               "$MAIN"
           )"
+
 
           echo "Architectures: $ARCHES"
 
@@ -3483,7 +3593,7 @@ jobs:
 
 
       # ============================================================
-      # Audit every built Mach-O
+      # Audit all built Mach-O deployment targets
       # ============================================================
 
       - name: Audit Mach-O deployment targets
@@ -3568,7 +3678,7 @@ jobs:
 
 
       # ============================================================
-      # Signatures / entitlements
+      # Code signatures / entitlements
       # ============================================================
 
       - name: Inspect code signatures
@@ -3582,6 +3692,7 @@ jobs:
 
           REPORT="../diagnostics/codesign-report.txt"
 
+
           {
             echo "============================================================"
             echo "Main application"
@@ -3592,6 +3703,7 @@ jobs:
               "$APP" \
               2>&1 \
               || true
+
 
             echo
             echo "============================================================"
@@ -3604,6 +3716,7 @@ jobs:
               "$APP" \
               2>&1 \
               || true
+
 
             echo
             echo "============================================================"
@@ -3807,7 +3920,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # ShareExtension patched/original sources
+          # ShareExtension sources
           # --------------------------------------------------------
 
           cp \
@@ -3835,7 +3948,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Package.resolved
+          # Package.resolved files
           # --------------------------------------------------------
 
           python3 <<'PY'
@@ -3913,6 +4026,7 @@ jobs:
           )
 
           if plugins_file.exists():
+
               data = json.loads(
                   plugins_file.read_text()
               )
@@ -3978,6 +4092,7 @@ jobs:
           )
 
           if path.exists():
+
               data = json.loads(
                   path.read_text()
               )
@@ -3994,6 +4109,7 @@ jobs:
                               "",
                           )
                       )
+
                       break
           PY
           )"
