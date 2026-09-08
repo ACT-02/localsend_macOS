@@ -2,6 +2,15 @@ name: LocalSend macOS High Sierra Backport
 
 on:
   workflow_dispatch:
+    inputs:
+      native_assets_strategy:
+        description: "Native Assets compatibility strategy"
+        required: true
+        default: "native-backport"
+        type: choice
+        options:
+          - "native-backport"
+          - "legacy-path-provider"
   push:
     branches:
       - main
@@ -14,6 +23,7 @@ env:
   RUST_VERSION: "1.97.1"
   LEGACY_MACOS_TARGET: "10.13"
   MACOSX_DEPLOYMENT_TARGET: "10.13"
+  NATIVE_ASSETS_STRATEGY: ${{ inputs.native_assets_strategy || 'native-backport' }}
 
 jobs:
   build:
@@ -148,12 +158,204 @@ jobs:
           set -euxo pipefail
           flutter clean
 
+      - name: Select Native Assets compatibility strategy
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Native Assets strategy: ${NATIVE_ASSETS_STRATEGY}"
+
+          case "${NATIVE_ASSETS_STRATEGY}" in
+            native-backport)
+              echo "Keeping path_provider_foundation 2.6.0 and backporting objective_c 9.5.0."
+              ;;
+
+            legacy-path-provider)
+              echo "Using path_provider_foundation 2.5.1 fallback (no objective_c Native Asset)."
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("app/pubspec.yaml")
+          text = path.read_text()
+
+          old = "  path_provider_foundation: 2.6.0\n"
+          new = "  path_provider_foundation: 2.5.1\n"
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: Expected direct path_provider_foundation 2.6.0 dependency not found."
+              )
+
+          path.write_text(text.replace(old, new, 1))
+          print("path_provider_foundation pinned to 2.5.1 fallback.")
+          PY
+              ;;
+
+            *)
+              echo "ERROR: Unknown NATIVE_ASSETS_STRATEGY=${NATIVE_ASSETS_STRATEGY}"
+              exit 1
+              ;;
+          esac
+
       - name: Flutter pub get
         working-directory: app
         shell: bash
         run: |
           set -euxo pipefail
           flutter pub get
+
+      # ============================================================
+      # objective_c 9.5.0 Native Asset
+      #
+      # Flutter 3.41.9 can only pass an integer macOS targetVersion
+      # to Native Assets and currently hardcodes 13. objective_c's
+      # hook turns that into -mmacos-version-min=13.
+      #
+      # Patch the package hook itself so clang and ld really target
+      # macOS 10.13. This is not a Mach-O metadata edit.
+      # ============================================================
+
+      - name: Backport objective_c Native Asset for High Sierra
+        if: env.NATIVE_ASSETS_STRATEGY == 'native-backport'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p diagnostics
+
+          OBJECTIVE_C_ROOT="$(
+            python3 <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
+
+          config_path = Path("app/.dart_tool/package_config.json").resolve()
+          data = json.loads(config_path.read_text())
+
+          entry = next(
+              (package for package in data.get("packages", []) if package.get("name") == "objective_c"),
+              None,
+          )
+
+          if entry is None:
+              raise SystemExit("ERROR: objective_c is not present in package_config.json.")
+
+          root_uri = entry["rootUri"]
+
+          if root_uri.startswith("file:"):
+              parsed = urlparse(root_uri)
+              root = Path(unquote(parsed.path))
+          else:
+              root = (config_path.parent / unquote(root_uri)).resolve()
+
+          print(root)
+          PY
+          )"
+
+          echo "objective_c root: $OBJECTIVE_C_ROOT"
+          echo "$OBJECTIVE_C_ROOT" > diagnostics/objective_c-root.txt
+
+          HOOK="$OBJECTIVE_C_ROOT/hook/build.dart"
+          PUBSPEC="$OBJECTIVE_C_ROOT/pubspec.yaml"
+
+          test -f "$HOOK"
+          test -f "$PUBSPEC"
+
+          VERSION="$(
+            python3 - "$PUBSPEC" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text()
+          match = re.search(r"(?m)^version:\s*([^\s]+)\s*$", text)
+          if not match:
+              raise SystemExit("ERROR: objective_c package version not found.")
+          print(match.group(1))
+          PY
+          )"
+
+          echo "objective_c version: $VERSION"
+
+          if [ "$VERSION" != "9.5.0" ]; then
+            echo "ERROR: This backport is validated against objective_c 9.5.0, got $VERSION."
+            exit 1
+          fi
+
+          cp "$HOOK" diagnostics/objective_c-build.dart.original
+
+          python3 - "$HOOK" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          pattern = re.compile(
+              r"(\s*assert\(codeConfig\.targetOS == OS\.macOS\);\s*)"
+              r"final targetVersion = codeConfig\.macOS\.targetVersion;\s*"
+              r"return '-mmacos-version-min=\$targetVersion';"
+          )
+
+          replacement = (
+              r"\1"
+              "// LocalSend High Sierra backport: Native Assets only expose an integer "
+              "macOS targetVersion, so force the real clang deployment target here.\n"
+              "  return '-mmacos-version-min=10.13';"
+          )
+
+          patched, count = pattern.subn(replacement, text, count=1)
+
+          if count != 1:
+              raise SystemExit(
+                  "ERROR: objective_c 9.5.0 minOSVersion() structure did not match expected source."
+              )
+
+          path.write_text(patched)
+
+          final = path.read_text()
+          if "return '-mmacos-version-min=10.13';" not in final:
+              raise SystemExit("ERROR: objective_c High Sierra hook patch was not written.")
+
+          if "return '-mmacos-version-min=$targetVersion';" in final:
+              raise SystemExit("ERROR: original objective_c dynamic macOS min-version return remains.")
+
+          print("objective_c hook now forces -mmacos-version-min=10.13.")
+          PY
+
+          cp "$HOOK" diagnostics/objective_c-build.dart.high-sierra
+
+          # Ensure hooks_runner cannot reuse a dill/cache compiled from the
+          # unmodified package hook. flutter clean does not necessarily own
+          # this whole cache hierarchy.
+          rm -rf app/.dart_tool/hooks_runner
+
+          echo "============================================================"
+          echo "Patched objective_c minOSVersion()"
+          echo "============================================================"
+          grep -n -A12 -B3 "String minOSVersion" "$HOOK"
+
+      - name: Verify Native Assets dependency strategy
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd app
+          flutter pub deps --style=compact > ../native-assets-pub-deps.txt
+          cd ..
+
+          if [ "$NATIVE_ASSETS_STRATEGY" = "native-backport" ]; then
+            grep -E 'objective_c[[:space:]]+9\.5\.0' native-assets-pub-deps.txt
+            grep -E 'path_provider_foundation[[:space:]]+2\.6\.0' native-assets-pub-deps.txt
+          else
+            grep -E 'path_provider_foundation[[:space:]]+2\.5\.1' native-assets-pub-deps.txt
+
+            if grep -E '(^|[[:space:]])objective_c([[:space:]]|$)' native-assets-pub-deps.txt; then
+              echo "ERROR: objective_c is still present under legacy-path-provider fallback."
+              exit 1
+            fi
+          fi
 
       - name: Verify StoreKit removal
         shell: bash
@@ -1544,6 +1746,221 @@ jobs:
               -
           plutil -lint ../diagnostics/LocalSend.entitlements.original.plist
 
+      # ============================================================
+      # Verify objective_c Native Asset was genuinely compiled for 10.13.
+      #
+      # In native-backport mode the final binary must:
+      #   - declare minOS <= 10.13
+      #   - not import post-High-Sierra Objective-C runtime helpers
+      #
+      # In legacy-path-provider mode objective_c.framework must not exist.
+      # ============================================================
+
+      - name: Verify objective_c Native Asset backport
+        working-directory: app
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ../diagnostics
+
+          FRAMEWORK="$APP/Contents/Frameworks/objective_c.framework"
+          BINARY="$FRAMEWORK/Versions/A/objective_c"
+
+          if [ "$NATIVE_ASSETS_STRATEGY" = "legacy-path-provider" ]; then
+            if [ -e "$FRAMEWORK" ]; then
+              echo "ERROR: objective_c.framework exists even though legacy fallback was selected."
+              exit 1
+            fi
+
+            echo "PASS: legacy path_provider fallback contains no objective_c Native Asset."
+            exit 0
+          fi
+
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: objective_c.framework was not produced in native-backport mode."
+            exit 1
+          fi
+
+          echo "============================================================"
+          echo "objective_c Native Asset"
+          echo "============================================================"
+
+          file "$BINARY"
+          lipo -archs "$BINARY"
+          otool -l "$BINARY" | awk '
+            /cmd LC_VERSION_MIN_MACOSX/ { show=1; count=0 }
+            /cmd LC_BUILD_VERSION/ { show=1; count=0 }
+            show { print; count++; if (count >= 10) show=0 }
+          '
+          otool -L "$BINARY"
+
+          nm -u -m "$BINARY" \
+            > ../diagnostics/objective_c.undefined-symbols.txt \
+            2>&1 || true
+
+          # These are compiler/runtime optimizations unavailable on High Sierra.
+          # objc_alloc_init: macOS 10.14.4+
+          # objc_opt_*:      macOS 10.15+
+          if grep -E '_objc_alloc_init|_objc_opt_' \
+            ../diagnostics/objective_c.undefined-symbols.txt; then
+
+            echo "ERROR: objective_c still imports post-10.13 libobjc entrypoints."
+            exit 1
+          fi
+
+          python3 - "$BINARY" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          binary = sys.argv[1]
+          output = subprocess.check_output(["otool", "-l", binary], text=True)
+
+          versions = []
+          for pattern in (
+              r"cmd LC_VERSION_MIN_MACOSX.*?\bversion\s+([0-9.]+)",
+              r"cmd LC_BUILD_VERSION.*?\bminos\s+([0-9.]+)",
+          ):
+              match = re.search(pattern, output, flags=re.DOTALL)
+              if match:
+                  versions.append(match.group(1))
+
+          if not versions:
+              raise SystemExit("ERROR: objective_c has no macOS deployment load command.")
+
+          def version_tuple(value):
+              parts = [int(part) for part in value.split(".")]
+              while len(parts) < 3:
+                  parts.append(0)
+              return tuple(parts[:3])
+
+          for version in versions:
+              if version_tuple(version) > version_tuple("10.13"):
+                  raise SystemExit(
+                      f"ERROR: objective_c Native Asset still requires macOS {version}."
+                  )
+
+          print(f"PASS: objective_c deployment markers are High Sierra compatible: {versions}")
+          PY
+
+          grep -n -- '-mmacos-version-min=10.13' ../flutter-macos-build.log \
+            > ../diagnostics/objective_c-min-version-build-log.txt \
+            || true
+
+      # ============================================================
+      # FlutterMacOS 3.41.9 is precompiled for Catalina and imports two
+      # libobjc helpers absent on High Sierra:
+      #
+      #   objc_alloc_init  (10.14.4+)
+      #   objc_opt_self    (10.15+)
+      #
+      # Build an x86_64/10.13 compatibility umbrella dylib that:
+      #   1. re-exports the real system libobjc;
+      #   2. supplies semantically equivalent implementations for only
+      #      those missing entrypoints.
+      #
+      # FlutterMacOS's existing libobjc load-command ordinal is then
+      # redirected to @rpath/HSObjC.dylib. Because HSObjC re-exports
+      # libobjc, all ordinary Objective-C runtime imports continue to
+      # resolve through the system runtime while the two missing helpers
+      # resolve locally.
+      # ============================================================
+
+      - name: Build High Sierra Objective-C runtime compatibility shim
+        working-directory: app
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ../diagnostics
+
+          FRAMEWORKS="$APP/Contents/Frameworks"
+          SHIM="$FRAMEWORKS/HSObjC.dylib"
+          SOURCE="../diagnostics/HSObjC.m"
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+
+          cat > "$SOURCE" <<'OBJC'
+          #include <objc/objc.h>
+          #include <objc/message.h>
+          #include <objc/runtime.h>
+
+          // macOS 10.14.4 added objc_alloc_init(). The documented semantic
+          // operation is exactly [[cls alloc] init], so reproduce that using
+          // message dispatch available on High Sierra. This also preserves
+          // custom +alloc and -init implementations.
+          __attribute__((visibility("default")))
+          id objc_alloc_init(Class cls) {
+            if (cls == Nil) {
+              return nil;
+            }
+
+            SEL allocSelector = sel_registerName("alloc");
+            SEL initSelector = sel_registerName("init");
+
+            id allocated = ((id (*)(id, SEL))objc_msgSend)((id)cls, allocSelector);
+            return ((id (*)(id, SEL))objc_msgSend)(allocated, initSelector);
+          }
+
+          // objc_opt_self() is the optimized runtime equivalent of [obj self].
+          // Send the actual message instead of merely returning obj so class
+          // realization/registration side effects are preserved.
+          __attribute__((visibility("default")))
+          id objc_opt_self(id obj) {
+            if (obj == nil) {
+              return nil;
+            }
+
+            SEL selfSelector = sel_registerName("self");
+            return ((id (*)(id, SEL))objc_msgSend)(obj, selfSelector);
+          }
+          OBJC
+
+          rm -f "$SHIM"
+
+          xcrun clang \
+            -dynamiclib \
+            -arch x86_64 \
+            -isysroot "$SDKROOT" \
+            -mmacosx-version-min=10.13 \
+            -install_name '@rpath/HSObjC.dylib' \
+            -Wl,-reexport-lobjc \
+            "$SOURCE" \
+            -o "$SHIM"
+
+          file "$SHIM"
+          lipo -archs "$SHIM"
+          otool -L "$SHIM"
+          otool -l "$SHIM" | awk '
+            /cmd LC_VERSION_MIN_MACOSX/ { show=1; count=0 }
+            /cmd LC_BUILD_VERSION/ { show=1; count=0 }
+            /cmd LC_REEXPORT_DYLIB/ { show=1; count=0 }
+            show { print; count++; if (count >= 10) show=0 }
+          ' \
+            | tee ../diagnostics/HSObjC.load-commands.txt
+
+          nm -gU "$SHIM" \
+            | tee ../diagnostics/HSObjC.exported-symbols.txt
+
+          for SYMBOL in _objc_alloc_init _objc_opt_self; do
+            if ! grep -Eq "[[:space:]]${SYMBOL}$" \
+              ../diagnostics/HSObjC.exported-symbols.txt; then
+
+              echo "ERROR: HSObjC does not export $SYMBOL."
+              exit 1
+            fi
+          done
+
+          if ! grep -q 'LC_REEXPORT_DYLIB' ../diagnostics/HSObjC.load-commands.txt; then
+            echo "ERROR: HSObjC does not re-export system libobjc."
+            exit 1
+          fi
+
+          if ! grep -q '/usr/lib/libobjc.A.dylib' ../diagnostics/HSObjC.load-commands.txt; then
+            echo "ERROR: HSObjC re-export does not point to system libobjc."
+            exit 1
+          fi
+
+          codesign --force --sign - "$SHIM"
+
       - name: Backport FlutterMacOS engine binary
         working-directory: app
         shell: bash
@@ -1602,6 +2019,23 @@ jobs:
               exit 1
             fi
           done
+
+          # Redirect FlutterMacOS's libobjc library ordinal to the High Sierra
+          # compatibility umbrella. The shim re-exports the real libobjc, so
+          # ordinary runtime symbols retain their two-level-namespace semantics.
+          SHIM="$APP/Contents/Frameworks/HSObjC.dylib"
+          test -f "$SHIM"
+
+          if otool -L "$BINARY" | grep -Fq '/usr/lib/libobjc.A.dylib'; then
+            install_name_tool \
+              -change \
+                '/usr/lib/libobjc.A.dylib' \
+                '@rpath/HSObjC.dylib' \
+              "$BINARY"
+          else
+            echo "ERROR: FlutterMacOS no longer has the expected system libobjc dependency."
+            exit 1
+          fi
 
           FRAMEWORK_PLIST="$FRAMEWORK/Versions/A/Resources/Info.plist"
           if [ -f "$FRAMEWORK_PLIST" ]; then
@@ -1671,6 +2105,16 @@ jobs:
           '
           otool -L "$BINARY"
 
+          if ! otool -L "$BINARY" | grep -Fq '@rpath/HSObjC.dylib'; then
+            echo "ERROR: FlutterMacOS was not redirected through HSObjC.dylib."
+            exit 1
+          fi
+
+          if otool -L "$BINARY" | grep -Fq '/usr/lib/libobjc.A.dylib'; then
+            echo "ERROR: FlutterMacOS still loads libobjc directly instead of HSObjC."
+            exit 1
+          fi
+
           if ! otool -l "$BINARY" | grep -A4 'LC_VERSION_MIN_MACOSX' | grep -q 'version 10.13'; then
             echo "ERROR: FlutterMacOS is not marked for macOS 10.13."
             exit 1
@@ -1682,6 +2126,20 @@ jobs:
           fi
 
           nm -u -m "$BINARY" > ../diagnostics/FlutterMacOS.undefined-symbols.txt 2>&1 || true
+
+          # The symbols still exist by name, but after changing the load-command
+          # ordinal they must resolve through HSObjC rather than system libobjc.
+          for SYMBOL in _objc_alloc_init _objc_opt_self; do
+            if ! grep -E "${SYMBOL}.*\(from HSObjC" \
+              ../diagnostics/FlutterMacOS.undefined-symbols.txt; then
+
+              echo "ERROR: $SYMBOL is not bound through HSObjC after FlutterMacOS patch."
+              echo "Relevant nm output:"
+              grep -E "${SYMBOL}|objc_opt_|objc_alloc_init" \
+                ../diagnostics/FlutterMacOS.undefined-symbols.txt || true
+              exit 1
+            fi
+          done
 
       - name: Force High Sierra minimum in application plist
         working-directory: app
@@ -1890,9 +2348,12 @@ jobs:
             done
 
           if [ -s "$ARM64_REPORT" ]; then
-            echo "WARNING: Some nested binaries remain universal."
+            echo "ERROR: arm64 remains in the final High Sierra bundle."
             cat "$ARM64_REPORT"
+            exit 1
           fi
+
+          echo "PASS: every final Mach-O is x86_64-only."
 
       - name: Audit final Mach-O deployment targets
         working-directory: app
@@ -1936,6 +2397,143 @@ jobs:
             /cmd LC_BUILD_VERSION/ { show=1; count=0 }
             show { print; count++; if (count >= 10) show=0 }
           '
+
+      # ============================================================
+      # Final runtime-gate audit. A green build is not accepted unless:
+      #   - every Mach-O declares macOS <= 10.13
+      #   - no binary imports post-10.13 libobjc helpers directly
+      #     from system libobjc
+      #   - FlutterMacOS's two known helpers are bound to HSObjC
+      # ============================================================
+
+      - name: Enforce High Sierra Mach-O and libobjc compatibility
+        working-directory: app
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ../diagnostics
+
+          python3 - "$APP" <<'PY'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          app = Path(sys.argv[1])
+          target = (10, 13, 0)
+
+          def parse_version(value):
+              parts = [int(part) for part in value.split(".")]
+              while len(parts) < 3:
+                  parts.append(0)
+              return tuple(parts[:3])
+
+          violations = []
+          scanned = 0
+
+          for path in app.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              file_result = subprocess.run(
+                  ["file", str(path)],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+              )
+
+              if "Mach-O" not in file_result.stdout:
+                  continue
+
+              scanned += 1
+
+              output = subprocess.check_output(
+                  ["otool", "-l", str(path)],
+                  text=True,
+              )
+
+              versions = []
+              for pattern in (
+                  r"cmd LC_VERSION_MIN_MACOSX.*?\bversion\s+([0-9.]+)",
+                  r"cmd LC_BUILD_VERSION.*?\bminos\s+([0-9.]+)",
+              ):
+                  match = re.search(pattern, output, flags=re.DOTALL)
+                  if match:
+                      versions.append(match.group(1))
+
+              if not versions:
+                  violations.append(
+                      f"NO_DEPLOYMENT_MARKER :: {path.relative_to(app)}"
+                  )
+                  continue
+
+              for version in versions:
+                  if parse_version(version) > target:
+                      violations.append(
+                          f"MINOS_{version} :: {path.relative_to(app)}"
+                      )
+
+          report = Path("../diagnostics/deployment-violations.txt")
+          report.write_text("\n".join(violations) + ("\n" if violations else ""))
+
+          print(f"Scanned {scanned} final Mach-O files.")
+
+          if violations:
+              print("ERROR: final bundle contains non-High-Sierra Mach-O files:")
+              print("\n".join(violations))
+              raise SystemExit(1)
+
+          print("PASS: every final Mach-O deployment marker is <= macOS 10.13.")
+          PY
+
+          RUNTIME_REPORT="../diagnostics/post-high-sierra-libobjc-imports.txt"
+          : > "$RUNTIME_REPORT"
+
+          find "$APP" -type f -print0 \
+          | while IFS= read -r -d '' FILE; do
+              if ! file "$FILE" | grep -q 'Mach-O'; then
+                continue
+              fi
+
+              NM_OUTPUT="$(nm -u -m "$FILE" 2>/dev/null || true)"
+
+              # Anything named objc_opt_* is Catalina-era. objc_alloc_init is
+              # Mojave 10.14.4+. The only allowed occurrences are FlutterMacOS
+              # imports whose provider has been redirected to HSObjC.
+              MATCHES="$(printf '%s\n' "$NM_OUTPUT" | grep -E '_objc_alloc_init|_objc_opt_' || true)"
+
+              if [ -z "$MATCHES" ]; then
+                continue
+              fi
+
+              RELATIVE="${FILE#$APP/}"
+
+              if [ "$RELATIVE" = "Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS" ]; then
+                BAD="$(printf '%s\n' "$MATCHES" | grep -v '(from HSObjC' || true)"
+
+                if [ -n "$BAD" ]; then
+                  {
+                    echo "$RELATIVE"
+                    printf '%s\n' "$BAD"
+                    echo
+                  } >> "$RUNTIME_REPORT"
+                fi
+              else
+                {
+                  echo "$RELATIVE"
+                  printf '%s\n' "$MATCHES"
+                  echo
+                } >> "$RUNTIME_REPORT"
+              fi
+            done
+
+          if [ -s "$RUNTIME_REPORT" ]; then
+            echo "ERROR: post-High-Sierra Objective-C runtime imports remain:"
+            cat "$RUNTIME_REPORT"
+            exit 1
+          fi
+
+          echo "PASS: no final binary directly imports post-10.13 libobjc helpers."
 
       - name: Inspect final code signatures
         working-directory: app
@@ -2036,10 +2634,20 @@ jobs:
           cp "$FLUTTER_ROOT/packages/flutter_tools/bin/podhelper.rb" diagnostics/flutter-podhelper.rb.after-patch 2>/dev/null
           cp app/macos/Flutter/ephemeral/FlutterMacOS.podspec diagnostics/FlutterMacOS.podspec.generated 2>/dev/null
 
-          FINAL_FLUTTER="$(find app/build/macos/Build/Products/Release -path '*/FlutterMacOS.framework/Versions/A/FlutterMacOS' -type f -print -quit)"
-          if [ -n "$FINAL_FLUTTER" ]; then
+          FINAL_APP="$(find app/build/macos/Build/Products/Release -maxdepth 1 -type d -name '*.app' -print -quit)"
+
+          if [ -n "$FINAL_APP" ]; then
+            FINAL_FLUTTER="$FINAL_APP/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"
+            FINAL_OBJECTIVE_C="$FINAL_APP/Contents/Frameworks/objective_c.framework/Versions/A/objective_c"
+            FINAL_HSOBJC="$FINAL_APP/Contents/Frameworks/HSObjC.dylib"
+
             cp "$FINAL_FLUTTER" diagnostics/FlutterMacOS.after-backport 2>/dev/null
+            cp "$FINAL_OBJECTIVE_C" diagnostics/objective_c.after-backport 2>/dev/null
+            cp "$FINAL_HSOBJC" diagnostics/HSObjC.dylib 2>/dev/null
           fi
+
+          cp native-assets-pub-deps.txt diagnostics/native-assets-pub-deps.txt 2>/dev/null
+          cp diagnostics/objective_c-root.txt diagnostics/objective_c-root.txt 2>/dev/null || true
 
       - name: Pack diagnostics
         if: always()
