@@ -2332,6 +2332,154 @@ jobs:
           print("PASS: FlutterMacOS exposes no stable-Swift class discriminator to libobjc.")
           PY
 
+          # ------------------------------------------------------------
+          # FlutterMacOS was originally compiled with a macOS 10.15+
+          # deployment target. In FlutterRenderer::SelectMetalDevice(),
+          # upstream source protects MTLDevice.hasUnifiedMemory with
+          # @available(macOS 10.15, *). Because the prebuilt engine itself
+          # targets 10.15, clang constant-folded that availability check
+          # away. Lowering LC_BUILD_VERSION/LC_VERSION_MIN_MACOSX later
+          # cannot reconstruct the missing branch, so High Sierra sends
+          # -hasUnifiedMemory to MTLIGAccelDevice and crashes with an
+          # unrecognized selector.
+          #
+          # Flutter's historical pre-10.15 Metal behavior is to treat
+          # hasUnifiedMemory as false. The same selector also appears in
+          # later Metal/Impeller code paths. Flutter 3.41.9 x86_64 contains
+          # exactly five BOOL-returning objc_msgSend call sites for this
+          # selector. Replace each six-byte indirect call with:
+          #
+          #   xor eax, eax        ; BOOL false
+          #   nop dword ptr [rax] ; pad back to six bytes
+          #
+          # This preserves surrounding control flow and reproduces the
+          # intended <10.15 result without pretending the GPU exposes a
+          # selector that High Sierra's Metal runtime does not implement.
+          # Fail closed on every original byte sequence so a future engine
+          # revision cannot be patched at stale addresses.
+          # ------------------------------------------------------------
+          python3 - "$BINARY" ../diagnostics/FlutterMacOS.hasUnifiedMemory-backport.txt <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          binary = Path(sys.argv[1])
+          report = Path(sys.argv[2])
+          blob = bytearray(binary.read_bytes())
+
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+
+          # VM address -> exact original machine code for the indirect
+          # objc_msgSend call in Flutter 3.41.9 x86_64.
+          expected_calls = {
+              0x0002BC63: bytes.fromhex("ff15a713d300"),
+              0x008AD2A2: bytes.fromhex("ff1568fd4a00"),
+              0x008AD2C7: bytes.fromhex("ff1543fd4a00"),
+              0x008AD2E2: bytes.fromhex("ff1528fd4a00"),
+              0x008AD2F7: bytes.fromhex("ff1513fd4a00"),
+          }
+          replacement = bytes.fromhex("31c00f1f4000")
+
+          def find_x86_64_slice(data):
+              magic = bytes(data[:4])
+              if magic == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 20
+                      cputype, _sub, offset, _size, _align = struct.unpack_from(
+                          ">IIIII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT binary has no x86_64 slice.")
+              if magic == b"\xca\xfe\xba\xbf":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 32
+                      cputype, _sub, offset, _size, _align, _reserved = struct.unpack_from(
+                          ">IIQQII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT64 binary has no x86_64 slice.")
+              if struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit(f"ERROR: unsupported Mach-O magic {magic.hex()}.")
+
+          slice_base = find_x86_64_slice(blob)
+          if struct.unpack_from("<I", blob, slice_base)[0] != MH_MAGIC_64:
+              raise SystemExit("ERROR: selected FlutterMacOS slice is not MH_MAGIC_64.")
+
+          ncmds = struct.unpack_from("<I", blob, slice_base + 16)[0]
+          cmd_off = slice_base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", blob, cmd_off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, cmd_off + 24
+                  )
+                  segments.append((vmaddr, vmsize, fileoff, filesize))
+              cmd_off += cmdsize
+
+          def vm_to_file(addr):
+              for vmaddr, _vmsize, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return slice_base + fileoff + (addr - vmaddr)
+              raise SystemExit(
+                  f"ERROR: hasUnifiedMemory call site {addr:#x} is not file-backed."
+              )
+
+          lines = []
+          for vmaddr, expected in expected_calls.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = bytes(blob[fileoff:fileoff + len(expected)])
+              lines.append(
+                  f"BEFORE vm={vmaddr:#010x} file={fileoff:#010x} bytes={actual.hex()}"
+              )
+              if actual != expected:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      "ERROR: FlutterMacOS hasUnifiedMemory call-site bytes changed at "
+                      f"{vmaddr:#x}: expected {expected.hex()}, found {actual.hex()}. "
+                      "Review the new engine before updating this backport."
+                  )
+
+          for vmaddr in expected_calls:
+              fileoff = vm_to_file(vmaddr)
+              blob[fileoff:fileoff + len(replacement)] = replacement
+              lines.append(
+                  f"PATCH  vm={vmaddr:#010x} file={fileoff:#010x} bytes={replacement.hex()}"
+              )
+
+          binary.write_bytes(blob)
+
+          # Re-open the file rather than trusting the in-memory bytearray.
+          verify = binary.read_bytes()
+          for vmaddr in expected_calls:
+              fileoff = vm_to_file(vmaddr)
+              actual = verify[fileoff:fileoff + len(replacement)]
+              lines.append(
+                  f"AFTER  vm={vmaddr:#010x} file={fileoff:#010x} bytes={actual.hex()}"
+              )
+              if actual != replacement:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      f"ERROR: failed to persist hasUnifiedMemory patch at {vmaddr:#x}."
+                  )
+
+          report.write_text("\n".join(lines) + "\n")
+          print("FlutterMacOS hasUnifiedMemory call sites patched: 5")
+          for line in lines:
+              print(line)
+          print(
+              "PASS: all FlutterMacOS hasUnifiedMemory getter calls now return false "
+              "on the High Sierra backport."
+          )
+          PY
+
           STRONG_SWIFT_LIBS=(
             "libswiftCore.dylib"
             "libswiftFoundation.dylib"
@@ -2372,6 +2520,75 @@ jobs:
             echo "ERROR: FlutterMacOS no longer has the expected system libobjc dependency."
             exit 1
           fi
+
+          # install_name_tool rewrites Mach-O load commands after the Metal
+          # availability patch. Re-open the final binary and prove that the
+          # five High Sierra-safe replacements are still present at their
+          # VM addresses before signing/packaging.
+          python3 - "$BINARY" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          blob = Path(sys.argv[1]).read_bytes()
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+          sites = (0x0002BC63, 0x008AD2A2, 0x008AD2C7, 0x008AD2E2, 0x008AD2F7)
+          replacement = bytes.fromhex("31c00f1f4000")
+
+          def find_slice(data):
+              magic = data[:4]
+              if magic == b"\xca\xfe\xba\xbe":
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(n):
+                      ct, _st, off, _sz, _al = struct.unpack_from(
+                          ">IIIII", data, 8 + i * 20
+                      )
+                      if ct == CPU_TYPE_X86_64:
+                          return off
+              elif magic == b"\xca\xfe\xba\xbf":
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(n):
+                      ct, _st, off, _sz, _al, _r = struct.unpack_from(
+                          ">IIQQII", data, 8 + i * 32
+                      )
+                      if ct == CPU_TYPE_X86_64:
+                          return off
+              elif struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit("ERROR: cannot locate x86_64 FlutterMacOS slice for Metal audit.")
+
+          base = find_slice(blob)
+          ncmds = struct.unpack_from("<I", blob, base + 16)[0]
+          off = base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from("<II", blob, off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, _vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, off + 24
+                  )
+                  segments.append((vmaddr, fileoff, filesize))
+              off += size
+
+          def vm_to_file(addr):
+              for vmaddr, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return base + fileoff + (addr - vmaddr)
+              raise SystemExit(f"ERROR: Metal audit VM address {addr:#x} is not file-backed.")
+
+          for addr in sites:
+              fileoff = vm_to_file(addr)
+              actual = blob[fileoff:fileoff + len(replacement)]
+              print(f"Metal final audit {addr:#010x}: {actual.hex()}")
+              if actual != replacement:
+                  raise SystemExit(
+                      f"ERROR: hasUnifiedMemory compatibility patch was lost at {addr:#x}."
+                  )
+
+          print("PASS: final FlutterMacOS retains all five High Sierra Metal availability patches.")
+          PY
 
           FRAMEWORK_PLIST="$FRAMEWORK/Versions/A/Resources/Info.plist"
           if [ -f "$FRAMEWORK_PLIST" ]; then
