@@ -2071,6 +2071,267 @@ jobs:
           mv "$TMP" "$BINARY"
           chmod +x "$BINARY"
 
+          # ------------------------------------------------------------
+          # Flutter 3.41.9's prebuilt FlutterMacOS was compiled for a
+          # 10.15+ Objective-C runtime. Its Swift classes therefore use
+          # FAST_IS_SWIFT_STABLE (class data bit 1). High Sierra's
+          # objc4-723 predates that flag and recognizes Swift classes via
+          # the legacy bit 0 instead. If left unchanged, 10.13 treats the
+          # class metadata as an ordinary Objective-C class and crashes in
+          # objc_allocWithZone while allocating FlutterRunLoop.
+          #
+          # Everything compiled by this workflow with a real 10.13 target
+          # already uses the legacy bit automatically. Only the prebuilt
+          # FlutterMacOS engine needs this metadata backport. Preserve every
+          # pointer/layout byte and change only the runtime discriminator:
+          #
+          #     FAST_IS_SWIFT_STABLE  0b010
+          #               ->
+          #     FAST_IS_SWIFT_LEGACY  0b001
+          #
+          # The five unique stable Swift classes in Flutter 3.41.9 are:
+          # FlutterRunLoop, ResizeSynchronizer, Logger, SyslogOutputWriter,
+          # and StdoutOutputWriter. Fail closed if that count changes so a
+          # future engine revision cannot be patched blindly.
+          # ------------------------------------------------------------
+          OBJDUMP="$(xcrun --find llvm-objdump)"
+          test -x "$OBJDUMP"
+
+          "$OBJDUMP" --macho --objc-meta-data "$BINARY" \
+            > ../diagnostics/FlutterMacOS.objc-metadata.before.txt
+
+          python3 - "$BINARY" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          blob = bytearray(path.read_bytes())
+
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+          EXPECTED_STABLE_CLASSES = 5
+
+          def find_x86_64_slice(data):
+              # FAT_MAGIC / FAT_MAGIC_64 are stored big-endian. The engine
+              # artifact is currently a one-slice universal container, but
+              # accept a genuinely thin x86_64 Mach-O as well.
+              magic_bytes = bytes(data[:4])
+
+              if magic_bytes == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for index in range(count):
+                      entry = 8 + index * 20
+                      cputype, _cpusubtype, offset, _size, _align = \
+                          struct.unpack_from(">IIIII", data, entry)
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT binary has no x86_64 slice.")
+
+              if magic_bytes == b"\xca\xfe\xba\xbf":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for index in range(count):
+                      entry = 8 + index * 32
+                      cputype, _cpusubtype, offset, _size, _align, _reserved = \
+                          struct.unpack_from(">IIQQII", data, entry)
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT64 binary has no x86_64 slice.")
+
+              if struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+
+              raise SystemExit(
+                  f"ERROR: Unsupported FlutterMacOS Mach-O magic: {magic_bytes.hex()}"
+              )
+
+          slice_base = find_x86_64_slice(blob)
+
+          if struct.unpack_from("<I", blob, slice_base)[0] != MH_MAGIC_64:
+              raise SystemExit("ERROR: x86_64 slice is not a 64-bit little-endian Mach-O.")
+
+          (
+              _magic,
+              cputype,
+              _cpusubtype,
+              _filetype,
+              ncmds,
+              _sizeofcmds,
+              _flags,
+              _reserved,
+          ) = struct.unpack_from("<IiiIIIII", blob, slice_base)
+
+          if (cputype & 0xFFFFFFFF) != CPU_TYPE_X86_64:
+              raise SystemExit(f"ERROR: selected slice has unexpected CPU type {cputype:#x}.")
+
+          segments = []
+          classlist = None
+          command_offset = slice_base + 32
+
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", blob, command_offset)
+
+              if cmd == LC_SEGMENT_64:
+                  segname = bytes(
+                      blob[command_offset + 8 : command_offset + 24]
+                  ).split(b"\0", 1)[0].decode("ascii", errors="replace")
+
+                  vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, command_offset + 24
+                  )
+                  nsects = struct.unpack_from("<I", blob, command_offset + 64)[0]
+
+                  segments.append((vmaddr, vmsize, fileoff, filesize, segname))
+
+                  section_offset = command_offset + 72
+                  for _section_index in range(nsects):
+                      sectname = bytes(
+                          blob[section_offset : section_offset + 16]
+                      ).split(b"\0", 1)[0].decode("ascii", errors="replace")
+                      section_segname = bytes(
+                          blob[section_offset + 16 : section_offset + 32]
+                      ).split(b"\0", 1)[0].decode("ascii", errors="replace")
+                      address, size = struct.unpack_from(
+                          "<QQ", blob, section_offset + 32
+                      )
+                      file_offset = struct.unpack_from(
+                          "<I", blob, section_offset + 48
+                      )[0]
+
+                      if sectname == "__objc_classlist":
+                          classlist = (
+                              address,
+                              size,
+                              file_offset,
+                              section_segname,
+                          )
+
+                      section_offset += 80
+
+              command_offset += cmdsize
+
+          if classlist is None:
+              raise SystemExit("ERROR: FlutterMacOS has no __objc_classlist section.")
+
+          def vm_to_file(vm_address):
+              for vmaddr, _vmsize, fileoff, filesize, _segname in segments:
+                  if vmaddr <= vm_address < vmaddr + filesize:
+                      return slice_base + fileoff + (vm_address - vmaddr)
+              raise SystemExit(
+                  f"ERROR: Objective-C class VM address {vm_address:#x} is not file-backed."
+              )
+
+          _classlist_address, classlist_size, classlist_fileoff, _segname = classlist
+          classlist_start = slice_base + classlist_fileoff
+
+          stable = []
+          unexpected_swift_flags = []
+
+          for cursor in range(
+              classlist_start,
+              classlist_start + classlist_size,
+              8,
+          ):
+              class_vmaddr = struct.unpack_from("<Q", blob, cursor)[0]
+              if class_vmaddr == 0:
+                  continue
+
+              class_fileoff = vm_to_file(class_vmaddr)
+
+              # objc_class on x86_64 is five machine words:
+              # isa, superclass, cache, vtable, class_data_bits_t.
+              bits_offset = class_fileoff + 4 * 8
+              bits = struct.unpack_from("<Q", blob, bits_offset)[0]
+              low_flags = bits & 0x7
+
+              if low_flags == 0x2:
+                  stable.append((class_vmaddr, bits_offset, bits))
+              elif low_flags & 0x2:
+                  # Do not guess how a future compiler combines the stable
+                  # Swift marker with additional image-time class flags.
+                  unexpected_swift_flags.append(
+                      (class_vmaddr, bits, low_flags)
+                  )
+
+          print(f"Stable Swift classes found in FlutterMacOS: {len(stable)}")
+          for class_vmaddr, bits_offset, bits in stable:
+              print(
+                  f"  class={class_vmaddr:#x} "
+                  f"data_bits={bits:#x} "
+                  f"file_offset={bits_offset:#x}"
+              )
+
+          if unexpected_swift_flags:
+              for class_vmaddr, bits, low_flags in unexpected_swift_flags:
+                  print(
+                      "ERROR: unexpected stable-Swift class flags: "
+                      f"class={class_vmaddr:#x} bits={bits:#x} "
+                      f"low={low_flags:#x}"
+                  )
+              raise SystemExit(1)
+
+          if len(stable) != EXPECTED_STABLE_CLASSES:
+              raise SystemExit(
+                  "ERROR: FlutterMacOS stable-Swift class count changed: "
+                  f"expected {EXPECTED_STABLE_CLASSES}, found {len(stable)}. "
+                  "Review the new engine metadata before updating this gate."
+              )
+
+          for class_vmaddr, bits_offset, bits in stable:
+              legacy_bits = (bits & ~0x2) | 0x1
+              struct.pack_into("<Q", blob, bits_offset, legacy_bits)
+              print(
+                  f"PATCH: class {class_vmaddr:#x}: "
+                  f"{bits:#x} -> {legacy_bits:#x}"
+              )
+
+          path.write_bytes(blob)
+          print(
+              "PASS: converted FlutterMacOS stable Swift class metadata "
+              "to the High Sierra legacy Swift discriminator."
+          )
+          PY
+
+          "$OBJDUMP" --macho --objc-meta-data "$BINARY" \
+            > ../diagnostics/FlutterMacOS.objc-metadata.after.txt
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("../diagnostics/FlutterMacOS.objc-metadata.after.txt")
+          text = path.read_text(errors="replace")
+
+          flags = []
+          for match in re.finditer(
+              r"data 0x([0-9a-fA-F]+) "
+              r"\(struct class_ro_t \*\) Swift class",
+              text,
+          ):
+              flags.append(int(match.group(1), 16) & 0x7)
+
+          stable = [flag for flag in flags if flag & 0x2]
+          legacy = [flag for flag in flags if flag & 0x1]
+
+          print(
+              "FlutterMacOS Objective-C-visible Swift metadata after patch: "
+              f"legacy appearances={len(legacy)}, stable appearances={len(stable)}"
+          )
+
+          if stable:
+              raise SystemExit(
+                  "ERROR: FlutterMacOS still contains stable-Swift ObjC class metadata."
+              )
+
+          if not legacy:
+              raise SystemExit(
+                  "ERROR: FlutterMacOS metadata audit found no legacy Swift classes."
+              )
+
+          print("PASS: FlutterMacOS exposes no stable-Swift class discriminator to libobjc.")
+          PY
+
           STRONG_SWIFT_LIBS=(
             "libswiftCore.dylib"
             "libswiftFoundation.dylib"
@@ -2476,6 +2737,9 @@ jobs:
       # ============================================================
       # Final runtime-gate audit. A green build is not accepted unless:
       #   - every Mach-O declares macOS <= 10.13
+      #   - no Objective-C-visible Swift class in the final bundle uses the
+      #     10.15-era stable-Swift class discriminator; 10.13 requires the
+      #     legacy discriminator
       #   - no binary imports post-10.13 libobjc helpers directly
       #     from system libobjc
       #   - FlutterMacOS's two known helpers are bound to HSObjC
@@ -2559,6 +2823,90 @@ jobs:
               raise SystemExit(1)
 
           print("PASS: every final Mach-O deployment marker is <= macOS 10.13.")
+          PY
+
+          # High Sierra's Objective-C runtime understands the pre-stable Swift
+          # class discriminator (bit 0), not FAST_IS_SWIFT_STABLE (bit 1).
+          # Source-built targets already get the legacy form from the compiler
+          # because their deployment target is genuinely 10.13. Audit the whole
+          # final bundle so a future prebuilt framework cannot silently re-add
+          # stable-Swift class metadata.
+          python3 - "$APP" <<'PY'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          app = Path(sys.argv[1])
+          objdump = subprocess.check_output(
+              ["xcrun", "--find", "llvm-objdump"],
+              text=True,
+          ).strip()
+
+          violations = []
+          swift_images = []
+
+          for path in app.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              file_result = subprocess.run(
+                  ["file", str(path)],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+              )
+              if "Mach-O" not in file_result.stdout:
+                  continue
+
+              result = subprocess.run(
+                  [objdump, "--macho", "--objc-meta-data", str(path)],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+              )
+
+              flags = []
+              for match in re.finditer(
+                  r"data 0x([0-9a-fA-F]+) "
+                  r"\(struct class_ro_t \*\) Swift class",
+                  result.stdout,
+              ):
+                  flags.append(int(match.group(1), 16) & 0x7)
+
+              if not flags:
+                  continue
+
+              relative = path.relative_to(app)
+              legacy_count = sum(1 for flag in flags if flag & 0x1)
+              stable_count = sum(1 for flag in flags if flag & 0x2)
+              swift_images.append(
+                  f"{relative} :: legacy={legacy_count} stable={stable_count}"
+              )
+
+              if stable_count:
+                  violations.append(
+                      f"{relative} :: stable-Swift appearances={stable_count}"
+                  )
+
+          Path("../diagnostics/swift-objc-metadata-audit.txt").write_text(
+              "\n".join(swift_images) + ("\n" if swift_images else "")
+          )
+          Path("../diagnostics/stable-swift-metadata-violations.txt").write_text(
+              "\n".join(violations) + ("\n" if violations else "")
+          )
+
+          print(f"Objective-C-visible Swift Mach-O images: {len(swift_images)}")
+
+          if violations:
+              print("ERROR: final bundle still contains stable-Swift class metadata:")
+              print("\n".join(violations))
+              raise SystemExit(1)
+
+          print(
+              "PASS: every Objective-C-visible Swift class in the final bundle "
+              "uses High Sierra-compatible legacy metadata."
+          )
           PY
 
           # Validate the exact dylib-version contract that High Sierra dyld
