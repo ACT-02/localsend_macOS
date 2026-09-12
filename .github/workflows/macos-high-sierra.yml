@@ -2346,8 +2346,10 @@ jobs:
           # Flutter's historical pre-10.15 Metal behavior is to treat
           # hasUnifiedMemory as false. The same selector also appears in
           # later Metal/Impeller code paths. Flutter 3.41.9 x86_64 contains
-          # exactly five BOOL-returning objc_msgSend call sites for this
-          # selector. Replace each six-byte indirect call with:
+          # five six-byte BOOL-returning objc_msgSend call sites in those
+          # runtime paths. (A sixth three-byte call in Skia's GPU dump path
+          # is handled together with the other availability-folded Metal
+          # properties below.) Replace each six-byte indirect call with:
           #
           #   xor eax, eax        ; BOOL false
           #   nop dword ptr [rax] ; pad back to six bytes
@@ -2480,6 +2482,343 @@ jobs:
           )
           PY
 
+
+          # ------------------------------------------------------------
+          # MTLDevice.supportsFamily: was introduced on macOS 10.15.
+          # Flutter 3.41.9's prebuilt engine targets 10.15+, so availability
+          # checks around these calls were compiled away. High Sierra's
+          # MTLIGAccelDevice therefore raises -doesNotRecognizeSelector:.
+          #
+          # This x86_64 backport is intentionally High Sierra + Intel only.
+          # Restore the old macOS capability semantics at all 14 call sites:
+          #
+          #   Apple* / MacCatalyst* / Mac2 -> false
+          #   Mac1                         -> true
+          #
+          # The two Mac1=true sites are important:
+          #   * one classifies the Intel device as legacy Mac-family hardware;
+          #   * one preserves Flutter's historical pre-10.15 16384x16384
+          #     maximum texture size on macOS.
+          #
+          # Replace each six-byte indirect objc_msgSend with a six-byte
+          # constant BOOL result, preserving all surrounding control flow.
+          # Fail closed on the exact original machine code so this cannot be
+          # silently applied to a different engine revision.
+          # ------------------------------------------------------------
+          python3 - "$BINARY" ../diagnostics/FlutterMacOS.supportsFamily-backport.txt <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          binary = Path(sys.argv[1])
+          report = Path(sys.argv[2])
+          blob = bytearray(binary.read_bytes())
+
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+
+          RET_FALSE = bytes.fromhex("31c00f1f4000")  # xor eax,eax; 4-byte nop
+          RET_TRUE  = bytes.fromhex("b80100000090")  # mov eax,1; nop
+
+          # VM address -> (exact original objc_msgSend bytes, replacement, meaning)
+          #
+          # NOTE: llvm-objdump mislabels four of the 0x4a09xx/0x4a0axx calls
+          # as containsString:. They still use the supportsFamily: selector
+          # kept in r13. The exact bytes and control flow are validated here,
+          # rather than relying on objdump's data-flow annotation.
+          sites = {
+              0x004A094E: (bytes.fromhex("ff15bcc68b00"), RET_FALSE, "Apple7 -> false"),
+              0x004A09AA: (bytes.fromhex("ff1560c68b00"), RET_FALSE, "Mac2 -> false"),
+              0x004A09BF: (bytes.fromhex("ff154bc68b00"), RET_FALSE, "MacCatalyst2 -> false"),
+              0x004A0ACB: (bytes.fromhex("ff153fc58b00"), RET_TRUE,  "Mac1 -> true"),
+              0x004A0AE0: (bytes.fromhex("ff152ac58b00"), RET_FALSE, "MacCatalyst1 -> false"),
+
+              0x008AD163: (bytes.fromhex("ff15a7fe4a00"), RET_FALSE, "Apple3 -> false"),
+              0x008AD17E: (bytes.fromhex("ff158cfe4a00"), RET_FALSE, "MacCatalyst1 -> false"),
+              0x008AD193: (bytes.fromhex("ff1577fe4a00"), RET_TRUE,  "Mac1 -> true"),
+              0x008AD28A: (bytes.fromhex("ff1580fd4a00"), RET_FALSE, "Apple2 -> false"),
+              0x008AD848: (bytes.fromhex("ff15c2f74a00"), RET_FALSE, "Apple8 -> false"),
+
+              0x008B2A04: (bytes.fromhex("ff1506a64a00"), RET_FALSE, "Apple2 -> false"),
+              0x008B2A64: (bytes.fromhex("ff15a6a54a00"), RET_FALSE, "Apple7 -> false"),
+              0x008B2A7C: (bytes.fromhex("ff158ea54a00"), RET_FALSE, "Mac2 -> false"),
+              0x008B2AF2: (bytes.fromhex("ff1518a54a00"), RET_FALSE, "Apple3 -> false"),
+          }
+
+          def find_x86_64_slice(data):
+              magic = bytes(data[:4])
+              if magic == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 20
+                      cputype, _sub, offset, _size, _align = struct.unpack_from(
+                          ">IIIII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT binary has no x86_64 slice.")
+              if magic == b"\xca\xfe\xba\xbf":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 32
+                      cputype, _sub, offset, _size, _align, _reserved = struct.unpack_from(
+                          ">IIQQII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT64 binary has no x86_64 slice.")
+              if struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit(f"ERROR: unsupported Mach-O magic {magic.hex()}.")
+
+          slice_base = find_x86_64_slice(blob)
+          if struct.unpack_from("<I", blob, slice_base)[0] != MH_MAGIC_64:
+              raise SystemExit("ERROR: selected FlutterMacOS slice is not MH_MAGIC_64.")
+
+          ncmds = struct.unpack_from("<I", blob, slice_base + 16)[0]
+          cmd_off = slice_base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", blob, cmd_off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, cmd_off + 24
+                  )
+                  segments.append((vmaddr, vmsize, fileoff, filesize))
+              cmd_off += cmdsize
+
+          def vm_to_file(addr):
+              for vmaddr, _vmsize, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return slice_base + fileoff + (addr - vmaddr)
+              raise SystemExit(
+                  f"ERROR: supportsFamily call site {addr:#x} is not file-backed."
+              )
+
+          lines = []
+          for vmaddr, (expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = bytes(blob[fileoff:fileoff + len(expected)])
+              lines.append(
+                  f"BEFORE vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={actual.hex()} {meaning}"
+              )
+              if actual != expected:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      "ERROR: FlutterMacOS supportsFamily call-site bytes changed at "
+                      f"{vmaddr:#x}: expected {expected.hex()}, found {actual.hex()}. "
+                      "Review the new engine before updating this backport."
+                  )
+
+          for vmaddr, (_expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              blob[fileoff:fileoff + len(replacement)] = replacement
+              lines.append(
+                  f"PATCH  vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={replacement.hex()} {meaning}"
+              )
+
+          binary.write_bytes(blob)
+
+          verify = binary.read_bytes()
+          for vmaddr, (_expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = verify[fileoff:fileoff + len(replacement)]
+              lines.append(
+                  f"AFTER  vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={actual.hex()} {meaning}"
+              )
+              if actual != replacement:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      f"ERROR: failed to persist supportsFamily patch at {vmaddr:#x}."
+                  )
+
+          report.write_text("\n".join(lines) + "\n")
+          print(f"FlutterMacOS supportsFamily call sites patched: {len(sites)}")
+          for line in lines:
+              print(line)
+          print(
+              "PASS: all FlutterMacOS supportsFamily calls now use "
+              "High Sierra Intel/Mac1 compatibility results."
+          )
+          PY
+
+
+          # ------------------------------------------------------------
+          # Restore the rest of Skia's Metal device-property availability
+          # behavior that was constant-folded away when FlutterMacOS was
+          # compiled for macOS 10.15+.
+          #
+          # Upstream Skia guards the following on macOS 10.15:
+          #   location, locationNumber, maxTransferRate, hasUnifiedMemory,
+          #   peerGroupID, peerCount, peerIndex,
+          #   areBarycentricCoordsSupported,
+          #   supportsShaderBarycentricCoordinates.
+          #
+          # It guards maxBufferLength and maxArgumentBufferSamplerCount on
+          # macOS 10.14. High Sierra implements none of these selectors.
+          #
+          # For this Intel-only High Sierra build:
+          #   * location -> BuiltIn (0)
+          #   * locationNumber -> 0 (low-power/integrated built-in GPU)
+          #   * maxTransferRate -> 0 (Metal's documented built-in-GPU value)
+          #   * hasUnifiedMemory / peer / barycentric diagnostic values -> 0
+          #   * maxArgumentBufferSamplerCount -> 0
+          #   * maxBufferLength -> 1 GiB, matching Skia's historical
+          #     pre-macOS-10.14 resource-provider fallback.
+          #
+          # These are all exact, fail-closed binary patches. The ordinary
+          # three-byte "call *%r15" sites become "xor eax,eax; nop".
+          # maxBufferLength needs a 64-bit-sized constant but the call is
+          # only three bytes, so replace its preceding seven-byte selector
+          # load plus call (10 bytes total) with "mov eax,0x40000000"
+          # followed by five NOPs. Writing EAX zero-extends into RAX.
+          # ------------------------------------------------------------
+          python3 - "$BINARY" ../diagnostics/FlutterMacOS.metal-properties-backport.txt <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          binary = Path(sys.argv[1])
+          report = Path(sys.argv[2])
+          blob = bytearray(binary.read_bytes())
+
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+
+          RET_ZERO_3 = bytes.fromhex("31c090")  # xor eax,eax; nop
+          RET_1G_10 = bytes.fromhex(
+              "b800000040"  # mov eax,0x40000000
+              "9090909090"  # pad to selector-load + call length
+          )
+
+          # VM address -> (exact original bytes, replacement, semantic value)
+          sites = {
+              0x004ABE10: (bytes.fromhex("41ffd7"), RET_ZERO_3, "location -> BuiltIn(0)"),
+              0x004ABE93: (bytes.fromhex("41ffd7"), RET_ZERO_3, "locationNumber -> 0"),
+              0x004ABEC1: (bytes.fromhex("41ffd7"), RET_ZERO_3, "maxTransferRate -> 0"),
+              0x004ABEEF: (bytes.fromhex("41ffd7"), RET_ZERO_3, "hasUnifiedMemory dump -> false"),
+              0x004ABF16: (bytes.fromhex("41ffd7"), RET_ZERO_3, "peerGroupID -> 0"),
+              0x004ABF44: (bytes.fromhex("41ffd7"), RET_ZERO_3, "peerCount -> 0"),
+              0x004ABF88: (bytes.fromhex("41ffd7"), RET_ZERO_3, "peerIndex -> 0"),
+              0x004AC1D1: (bytes.fromhex("41ffd7"), RET_ZERO_3, "areBarycentricCoordsSupported -> false"),
+              0x004AC1F8: (bytes.fromhex("41ffd7"), RET_ZERO_3, "supportsShaderBarycentricCoordinates -> false"),
+              0x004AC218: (
+                  bytes.fromhex("488b35191e910041ffd7"),
+                  RET_1G_10,
+                  "maxBufferLength -> 1 GiB",
+              ),
+              0x004AC320: (
+                  bytes.fromhex("41ffd7"),
+                  RET_ZERO_3,
+                  "maxArgumentBufferSamplerCount -> 0",
+              ),
+          }
+
+          def find_x86_64_slice(data):
+              magic = bytes(data[:4])
+              if magic == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 20
+                      cputype, _sub, offset, _size, _align = struct.unpack_from(
+                          ">IIIII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT binary has no x86_64 slice.")
+              if magic == b"\xca\xfe\xba\xbf":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 32
+                      cputype, _sub, offset, _size, _align, _reserved = struct.unpack_from(
+                          ">IIQQII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT64 binary has no x86_64 slice.")
+              if struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit(f"ERROR: unsupported Mach-O magic {magic.hex()}.")
+
+          slice_base = find_x86_64_slice(blob)
+          if struct.unpack_from("<I", blob, slice_base)[0] != MH_MAGIC_64:
+              raise SystemExit("ERROR: selected FlutterMacOS slice is not MH_MAGIC_64.")
+
+          ncmds = struct.unpack_from("<I", blob, slice_base + 16)[0]
+          cmd_off = slice_base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", blob, cmd_off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, cmd_off + 24
+                  )
+                  segments.append((vmaddr, vmsize, fileoff, filesize))
+              cmd_off += cmdsize
+
+          def vm_to_file(addr):
+              for vmaddr, _vmsize, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return slice_base + fileoff + (addr - vmaddr)
+              raise SystemExit(
+                  f"ERROR: Metal property call site {addr:#x} is not file-backed."
+              )
+
+          lines = []
+          for vmaddr, (expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = bytes(blob[fileoff:fileoff + len(expected)])
+              lines.append(
+                  f"BEFORE vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={actual.hex()} {meaning}"
+              )
+              if actual != expected:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      "ERROR: FlutterMacOS Metal-property bytes changed at "
+                      f"{vmaddr:#x}: expected {expected.hex()}, found {actual.hex()}. "
+                      "Review the new engine before updating this backport."
+                  )
+
+          for vmaddr, (_expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              blob[fileoff:fileoff + len(replacement)] = replacement
+              lines.append(
+                  f"PATCH  vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={replacement.hex()} {meaning}"
+              )
+
+          binary.write_bytes(blob)
+
+          verify = binary.read_bytes()
+          for vmaddr, (_expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = verify[fileoff:fileoff + len(replacement)]
+              lines.append(
+                  f"AFTER  vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={actual.hex()} {meaning}"
+              )
+              if actual != replacement:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      f"ERROR: failed to persist Metal-property patch at {vmaddr:#x}."
+                  )
+
+          report.write_text("\n".join(lines) + "\n")
+          print(f"FlutterMacOS additional Metal property call sites patched: {len(sites)}")
+          for line in lines:
+              print(line)
+          print(
+              "PASS: pre-10.14/10.15 Metal device-property calls now use "
+              "High Sierra-compatible fallback values."
+          )
+          PY
+
           STRONG_SWIFT_LIBS=(
             "libswiftCore.dylib"
             "libswiftFoundation.dylib"
@@ -2522,9 +2861,9 @@ jobs:
           fi
 
           # install_name_tool rewrites Mach-O load commands after the Metal
-          # availability patch. Re-open the final binary and prove that the
-          # five High Sierra-safe replacements are still present at their
-          # VM addresses before signing/packaging.
+          # availability patches. Re-open the final binary and prove that
+          # all High Sierra-safe replacements are still present at their VM
+          # addresses before signing/packaging.
           python3 - "$BINARY" <<'PY'
           import struct
           import sys
@@ -2534,8 +2873,51 @@ jobs:
           CPU_TYPE_X86_64 = 0x01000007
           MH_MAGIC_64 = 0xFEEDFACF
           LC_SEGMENT_64 = 0x19
-          sites = (0x0002BC63, 0x008AD2A2, 0x008AD2C7, 0x008AD2E2, 0x008AD2F7)
-          replacement = bytes.fromhex("31c00f1f4000")
+
+          RET_FALSE = bytes.fromhex("31c00f1f4000")
+          RET_TRUE = bytes.fromhex("b80100000090")
+
+          has_unified_memory_sites = {
+              0x0002BC63: RET_FALSE,
+              0x008AD2A2: RET_FALSE,
+              0x008AD2C7: RET_FALSE,
+              0x008AD2E2: RET_FALSE,
+              0x008AD2F7: RET_FALSE,
+          }
+
+          supports_family_sites = {
+              0x004A094E: RET_FALSE,
+              0x004A09AA: RET_FALSE,
+              0x004A09BF: RET_FALSE,
+              0x004A0ACB: RET_TRUE,
+              0x004A0AE0: RET_FALSE,
+              0x008AD163: RET_FALSE,
+              0x008AD17E: RET_FALSE,
+              0x008AD193: RET_TRUE,
+              0x008AD28A: RET_FALSE,
+              0x008AD848: RET_FALSE,
+              0x008B2A04: RET_FALSE,
+              0x008B2A64: RET_FALSE,
+              0x008B2A7C: RET_FALSE,
+              0x008B2AF2: RET_FALSE,
+          }
+
+          RET_ZERO_3 = bytes.fromhex("31c090")
+          RET_1G_10 = bytes.fromhex("b8000000409090909090")
+
+          metal_property_sites = {
+              0x004ABE10: RET_ZERO_3,
+              0x004ABE93: RET_ZERO_3,
+              0x004ABEC1: RET_ZERO_3,
+              0x004ABEEF: RET_ZERO_3,
+              0x004ABF16: RET_ZERO_3,
+              0x004ABF44: RET_ZERO_3,
+              0x004ABF88: RET_ZERO_3,
+              0x004AC1D1: RET_ZERO_3,
+              0x004AC1F8: RET_ZERO_3,
+              0x004AC218: RET_1G_10,
+              0x004AC320: RET_ZERO_3,
+          }
 
           def find_slice(data):
               magic = data[:4]
@@ -2578,16 +2960,29 @@ jobs:
                       return base + fileoff + (addr - vmaddr)
               raise SystemExit(f"ERROR: Metal audit VM address {addr:#x} is not file-backed.")
 
-          for addr in sites:
-              fileoff = vm_to_file(addr)
-              actual = blob[fileoff:fileoff + len(replacement)]
-              print(f"Metal final audit {addr:#010x}: {actual.hex()}")
-              if actual != replacement:
-                  raise SystemExit(
-                      f"ERROR: hasUnifiedMemory compatibility patch was lost at {addr:#x}."
+          for name, sites in (
+              ("hasUnifiedMemory", has_unified_memory_sites),
+              ("supportsFamily", supports_family_sites),
+              ("MetalPropertyFallback", metal_property_sites),
+          ):
+              for addr, expected in sites.items():
+                  fileoff = vm_to_file(addr)
+                  actual = blob[fileoff:fileoff + len(expected)]
+                  print(
+                      f"Metal final audit {name} {addr:#010x}: "
+                      f"{actual.hex()} expected={expected.hex()}"
                   )
+                  if actual != expected:
+                      raise SystemExit(
+                          f"ERROR: {name} compatibility patch was lost at {addr:#x}."
+                      )
 
-          print("PASS: final FlutterMacOS retains all five High Sierra Metal availability patches.")
+          print(
+              "PASS: final FlutterMacOS retains all 30 High Sierra Metal "
+              "availability patches "
+              "(5 hasUnifiedMemory runtime + 14 supportsFamily + "
+              "11 availability-folded device properties)."
+          )
           PY
 
           FRAMEWORK_PLIST="$FRAMEWORK/Versions/A/Resources/Info.plist"
