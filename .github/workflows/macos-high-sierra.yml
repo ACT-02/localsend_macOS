@@ -1967,6 +1967,8 @@ jobs:
             -isysroot "$SDKROOT" \
             -mmacosx-version-min=10.13 \
             -install_name '@rpath/HSObjC.dylib' \
+            -Wl,-compatibility_version,1.0.0 \
+            -Wl,-current_version,1.0.0 \
             -Wl,-reexport-lobjc \
             "$SOURCE" \
             -o "$SHIM"
@@ -1977,10 +1979,14 @@ jobs:
           otool -l "$SHIM" | awk '
             /cmd LC_VERSION_MIN_MACOSX/ { show=1; count=0 }
             /cmd LC_BUILD_VERSION/ { show=1; count=0 }
+            /cmd LC_ID_DYLIB/ { show=1; count=0 }
             /cmd LC_REEXPORT_DYLIB/ { show=1; count=0 }
             show { print; count++; if (count >= 10) show=0 }
           ' \
             | tee ../diagnostics/HSObjC.load-commands.txt
+
+          otool -L "$SHIM" \
+            | tee ../diagnostics/HSObjC.linked-libraries.txt
 
           nm -gU "$SHIM" \
             | tee ../diagnostics/HSObjC.exported-symbols.txt
@@ -2001,6 +2007,30 @@ jobs:
 
           if ! grep -q '/usr/lib/libobjc.A.dylib' ../diagnostics/HSObjC.load-commands.txt; then
             echo "ERROR: HSObjC re-export does not point to system libobjc."
+            exit 1
+          fi
+
+          # FlutterMacOS's original /usr/lib/libobjc.A.dylib load command
+          # requires compatibility version 1.0.0. install_name_tool -change
+          # preserves that requirement when redirecting the dependency to
+          # HSObjC. A newly linked dylib defaults to current version 0.0.0,
+          # which High Sierra dyld rejects as "Wrong version" even though the
+          # file and symbols are otherwise correct. Require HSObjC to advertise
+          # both compatibility and current version 1.0.0.
+          HSOBJC_ID_LINE="$(
+            otool -L "$SHIM" \
+              | grep -F '@rpath/HSObjC.dylib (' \
+              | head -1 \
+              || true
+          )"
+
+          echo "HSObjC LC_ID_DYLIB: $HSOBJC_ID_LINE"
+
+          if ! printf '%s\n' "$HSOBJC_ID_LINE" \
+            | grep -Fq 'compatibility version 1.0.0, current version 1.0.0'; then
+
+            echo "ERROR: HSObjC dylib version metadata is not 1.0.0/1.0.0."
+            otool -L "$SHIM"
             exit 1
           fi
 
@@ -2530,6 +2560,62 @@ jobs:
 
           print("PASS: every final Mach-O deployment marker is <= macOS 10.13.")
           PY
+
+          # Validate the exact dylib-version contract that High Sierra dyld
+          # enforces when FlutterMacOS loads HSObjC.
+          HSOBJC="$APP/Contents/Frameworks/HSObjC.dylib"
+          FLUTTER_BINARY="$APP/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"
+
+          test -f "$HSOBJC"
+          test -f "$FLUTTER_BINARY"
+
+          HSOBJC_ID_LINE="$(
+            otool -L "$HSOBJC" \
+              | grep -F '@rpath/HSObjC.dylib (' \
+              | head -1 \
+              || true
+          )"
+
+          FLUTTER_HSOBJC_LINE="$(
+            otool -L "$FLUTTER_BINARY" \
+              | grep -F '@rpath/HSObjC.dylib (' \
+              | head -1 \
+              || true
+          )"
+
+          {
+            echo "HSObjC identity:"
+            echo "$HSOBJC_ID_LINE"
+            echo
+            echo "FlutterMacOS dependency:"
+            echo "$FLUTTER_HSOBJC_LINE"
+          } | tee ../diagnostics/HSObjC-version-contract.txt
+
+          if ! printf '%s\n' "$HSOBJC_ID_LINE" \
+            | grep -Fq 'compatibility version 1.0.0, current version 1.0.0'; then
+
+            echo "ERROR: HSObjC does not provide dylib version 1.0.0."
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$FLUTTER_HSOBJC_LINE" \
+            | grep -Fq '@rpath/HSObjC.dylib'; then
+
+            echo "ERROR: FlutterMacOS is not linked to HSObjC."
+            exit 1
+          fi
+
+          # The original libobjc dependency requires compatibility version
+          # 1.0.0. Keep this assertion explicit so CI catches the exact failure
+          # that High Sierra dyld reported during the first real launch.
+          if ! printf '%s\n' "$FLUTTER_HSOBJC_LINE" \
+            | grep -Fq 'compatibility version 1.0.0'; then
+
+            echo "ERROR: FlutterMacOS -> HSObjC requires an unexpected compatibility version."
+            exit 1
+          fi
+
+          echo "PASS: HSObjC dylib version contract satisfies FlutterMacOS."
 
           RUNTIME_REPORT="../diagnostics/post-high-sierra-libobjc-imports.txt"
           : > "$RUNTIME_REPORT"
