@@ -2305,9 +2305,9 @@ jobs:
 
           flags = []
           for match in re.finditer(
-              r"data 0x([0-9a-fA-F]+) "
-              r"\(struct class_ro_t \*\) Swift class",
+              r"^\s*data\s+0x([0-9a-fA-F]+)\s+Swift class\s*$",
               text,
+              re.MULTILINE,
           ):
               flags.append(int(match.group(1), 16) & 0x7)
 
@@ -2868,9 +2868,9 @@ jobs:
 
               flags = []
               for match in re.finditer(
-                  r"data 0x([0-9a-fA-F]+) "
-                  r"\(struct class_ro_t \*\) Swift class",
+                  r"^\s*data\s+0x([0-9a-fA-F]+)\s+Swift class\s*$",
                   result.stdout,
+                  re.MULTILINE,
               ):
                   flags.append(int(match.group(1), 16) & 0x7)
 
