@@ -2819,6 +2819,163 @@ jobs:
           )
           PY
 
+          # ------------------------------------------------------------
+          # Dart VM macOS runtime floor backport.
+          #
+          # Flutter 3.41.9's embedded Dart VM was compiled with a macOS 10.15
+          # minimum. Dart's CheckIsAtLeastMinRequiredMacOSVersion() therefore
+          # contains an explicit run-time policy gate equivalent to:
+          #
+          #   if (current_version >= 10.15) return nullptr;
+          #
+          # Because the comparison is compiled as "current > 10.14.99", simply
+          # lowering LC_VERSION_MIN_MACOSX does not affect it. On a real 10.13
+          # system the VM reaches this gate after Flutter/Metal initialization
+          # and aborts with:
+          #
+          #   Current Mac OS X version 10.13 is lower than minimum supported
+          #   version 10.15
+          #
+          # Preserve the guard rather than bypassing it. Retarget its minimum to
+          # 10.13 by changing the unique comparison constant 10.14.99 -> 10.12.99,
+          # so >=10.13 passes while 10.12 and older still fail. Also change the
+          # human-readable minimum minor version from 15 -> 13.
+          #
+          # Flutter 3.41.9 x86_64 VM addresses:
+          #   0x00A087DB: cmp $101499, %ecx  -> cmp $101299, %ecx
+          #   0x00A08845: mov $15, %r8d      -> mov $13, %r8d
+          #
+          # Fail closed on exact original bytes so a future Dart/Flutter engine
+          # revision cannot receive stale machine-code offsets silently.
+          # ------------------------------------------------------------
+          python3 - "$BINARY" ../diagnostics/FlutterMacOS.dart-vm-macos-gate-backport.txt <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          binary = Path(sys.argv[1])
+          report = Path(sys.argv[2])
+          blob = bytearray(binary.read_bytes())
+
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+
+          sites = {
+              # Dart CheckIsAtLeastMinRequiredMacOSVersion():
+              # current > 10.14.99  -> current > 10.12.99
+              0x00A087DB: (
+                  bytes.fromhex("81f97b8c0100"),
+                  bytes.fromhex("81f9b38b0100"),
+                  "Dart VM minimum macOS comparison 10.15 -> 10.13",
+              ),
+              # Error text argument: minimum minor version 15 -> 13.
+              0x00A08845: (
+                  bytes.fromhex("41b80f000000"),
+                  bytes.fromhex("41b80d000000"),
+                  "Dart VM minimum macOS diagnostic 10.15 -> 10.13",
+              ),
+          }
+
+          def find_x86_64_slice(data):
+              magic = bytes(data[:4])
+              if magic == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 20
+                      cputype, _sub, offset, _size, _align = struct.unpack_from(
+                          ">IIIII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT binary has no x86_64 slice.")
+              if magic == b"\xca\xfe\xba\xbf":
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(count):
+                      off = 8 + i * 32
+                      cputype, _sub, offset, _size, _align, _reserved = struct.unpack_from(
+                          ">IIQQII", data, off
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return offset
+                  raise SystemExit("ERROR: FlutterMacOS FAT64 binary has no x86_64 slice.")
+              if struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit(f"ERROR: unsupported Mach-O magic {magic.hex()}.")
+
+          slice_base = find_x86_64_slice(blob)
+          if struct.unpack_from("<I", blob, slice_base)[0] != MH_MAGIC_64:
+              raise SystemExit("ERROR: selected FlutterMacOS slice is not MH_MAGIC_64.")
+
+          ncmds = struct.unpack_from("<I", blob, slice_base + 16)[0]
+          cmd_off = slice_base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", blob, cmd_off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, _vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, cmd_off + 24
+                  )
+                  segments.append((vmaddr, fileoff, filesize))
+              cmd_off += cmdsize
+
+          def vm_to_file(addr):
+              for vmaddr, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return slice_base + fileoff + (addr - vmaddr)
+              raise SystemExit(
+                  f"ERROR: Dart VM macOS gate address {addr:#x} is not file-backed."
+              )
+
+          lines = []
+          for vmaddr, (expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = bytes(blob[fileoff:fileoff + len(expected)])
+              lines.append(
+                  f"BEFORE vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={actual.hex()} {meaning}"
+              )
+              if actual != expected:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      "ERROR: FlutterMacOS Dart VM macOS-gate bytes changed at "
+                      f"{vmaddr:#x}: expected {expected.hex()}, found {actual.hex()}. "
+                      "Review the new Dart/Flutter engine before updating this backport."
+                  )
+
+          for vmaddr, (_expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              blob[fileoff:fileoff + len(replacement)] = replacement
+              lines.append(
+                  f"PATCH  vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={replacement.hex()} {meaning}"
+              )
+
+          binary.write_bytes(blob)
+
+          verify = binary.read_bytes()
+          for vmaddr, (_expected, replacement, meaning) in sites.items():
+              fileoff = vm_to_file(vmaddr)
+              actual = verify[fileoff:fileoff + len(replacement)]
+              lines.append(
+                  f"AFTER  vm={vmaddr:#010x} file={fileoff:#010x} "
+                  f"bytes={actual.hex()} {meaning}"
+              )
+              if actual != replacement:
+                  report.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      f"ERROR: failed to persist Dart VM macOS-gate patch at {vmaddr:#x}."
+                  )
+
+          report.write_text("\n".join(lines) + "\n")
+          for line in lines:
+              print(line)
+          print(
+              "PASS: Dart VM runtime macOS floor is now 10.13, while the "
+              "explicit guard remains intact for 10.12 and older."
+          )
+          PY
+
           STRONG_SWIFT_LIBS=(
             "libswiftCore.dylib"
             "libswiftFoundation.dylib"
@@ -2983,6 +3140,80 @@ jobs:
               "(5 hasUnifiedMemory runtime + 14 supportsFamily + "
               "11 availability-folded device properties)."
           )
+          PY
+
+          # install_name_tool only edits load commands, but re-open the final
+          # FlutterMacOS and prove that the Dart VM 10.13 policy patch survived
+          # every Mach-O rewrite before signing and packaging.
+          python3 - "$BINARY" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          blob = Path(sys.argv[1]).read_bytes()
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+
+          expected_sites = {
+              0x00A087DB: bytes.fromhex("81f9b38b0100"),
+              0x00A08845: bytes.fromhex("41b80d000000"),
+          }
+
+          def find_slice(data):
+              magic = data[:4]
+              if magic == b"\xca\xfe\xba\xbe":
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(n):
+                      ct, _st, off, _sz, _al = struct.unpack_from(
+                          ">IIIII", data, 8 + i * 20
+                      )
+                      if ct == CPU_TYPE_X86_64:
+                          return off
+              elif magic == b"\xca\xfe\xba\xbf":
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(n):
+                      ct, _st, off, _sz, _al, _r = struct.unpack_from(
+                          ">IIQQII", data, 8 + i * 32
+                      )
+                      if ct == CPU_TYPE_X86_64:
+                          return off
+              elif struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit("ERROR: cannot locate x86_64 FlutterMacOS slice for Dart gate audit.")
+
+          base = find_slice(blob)
+          ncmds = struct.unpack_from("<I", blob, base + 16)[0]
+          off = base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from("<II", blob, off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, _vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, off + 24
+                  )
+                  segments.append((vmaddr, fileoff, filesize))
+              off += size
+
+          def vm_to_file(addr):
+              for vmaddr, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return base + fileoff + (addr - vmaddr)
+              raise SystemExit(f"ERROR: Dart gate audit address {addr:#x} is not file-backed.")
+
+          for addr, expected in expected_sites.items():
+              fileoff = vm_to_file(addr)
+              actual = blob[fileoff:fileoff + len(expected)]
+              print(
+                  f"Dart VM final audit {addr:#010x}: "
+                  f"{actual.hex()} expected={expected.hex()}"
+              )
+              if actual != expected:
+                  raise SystemExit(
+                      f"ERROR: Dart VM macOS 10.13 gate patch was lost at {addr:#x}."
+                  )
+
+          print("PASS: final FlutterMacOS retains the Dart VM macOS 10.13 runtime gate.")
           PY
 
           FRAMEWORK_PLIST="$FRAMEWORK/Versions/A/Resources/Info.plist"
@@ -3435,6 +3666,80 @@ jobs:
               raise SystemExit(1)
 
           print("PASS: every final Mach-O deployment marker is <= macOS 10.13.")
+          PY
+
+          # Final bundle Dart VM policy audit. This is intentionally independent
+          # of the earlier engine-backport step so artifact packaging cannot
+          # silently replace FlutterMacOS with an unpatched copy.
+          python3 - "$APP/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          binary = Path(sys.argv[1])
+          blob = binary.read_bytes()
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SEGMENT_64 = 0x19
+          expected_sites = {
+              0x00A087DB: bytes.fromhex("81f9b38b0100"),
+              0x00A08845: bytes.fromhex("41b80d000000"),
+          }
+
+          def find_slice(data):
+              magic = data[:4]
+              if magic == b"\xca\xfe\xba\xbe":
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(n):
+                      ct, _st, off, _sz, _al = struct.unpack_from(
+                          ">IIIII", data, 8 + i * 20
+                      )
+                      if ct == CPU_TYPE_X86_64:
+                          return off
+              elif magic == b"\xca\xfe\xba\xbf":
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  for i in range(n):
+                      ct, _st, off, _sz, _al, _r = struct.unpack_from(
+                          ">IIQQII", data, 8 + i * 32
+                      )
+                      if ct == CPU_TYPE_X86_64:
+                          return off
+              elif struct.unpack_from("<I", data, 0)[0] == MH_MAGIC_64:
+                  return 0
+              raise SystemExit("ERROR: final FlutterMacOS has no x86_64 slice.")
+
+          base = find_slice(blob)
+          ncmds = struct.unpack_from("<I", blob, base + 16)[0]
+          off = base + 32
+          segments = []
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from("<II", blob, off)
+              if cmd == LC_SEGMENT_64:
+                  vmaddr, _vmsize, fileoff, filesize = struct.unpack_from(
+                      "<QQQQ", blob, off + 24
+                  )
+                  segments.append((vmaddr, fileoff, filesize))
+              off += size
+
+          def vm_to_file(addr):
+              for vmaddr, fileoff, filesize in segments:
+                  if vmaddr <= addr < vmaddr + filesize:
+                      return base + fileoff + (addr - vmaddr)
+              raise SystemExit(f"ERROR: final Dart gate address {addr:#x} is not file-backed.")
+
+          for addr, expected in expected_sites.items():
+              fileoff = vm_to_file(addr)
+              actual = blob[fileoff:fileoff + len(expected)]
+              if actual != expected:
+                  raise SystemExit(
+                      "ERROR: final bundle does not contain the Dart VM macOS 10.13 "
+                      f"gate patch at {addr:#x}: {actual.hex()} != {expected.hex()}"
+                  )
+
+          print(
+              "PASS: final bundled Dart VM accepts macOS 10.13 and still rejects "
+              "macOS 10.12 and older."
+          )
           PY
 
           # High Sierra's Objective-C runtime understands the pre-stable Swift
