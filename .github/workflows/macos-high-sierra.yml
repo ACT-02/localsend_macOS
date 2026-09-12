@@ -3000,6 +3000,57 @@ jobs:
             fi
           done
 
+          # FlutterMacOS also carries LC_LOAD_WEAK_DYLIB entries for a
+          # number of Swift overlays at /usr/lib/swift/*.dylib. High Sierra
+          # predates those shared-cache Swift overlay paths. Mach-O two-level
+          # namespace bindings still remember the direct dylib ordinal, so a
+          # symbol can fail to bind even if a different @rpath copy of the same
+          # overlay was loaded transitively by another image.
+          #
+          # Flutter 3.41.9 demonstrates exactly that with Darwin.stdout: the
+          # symbol is a non-weak undefined reference whose library ordinal points
+          # at /usr/lib/swift/libswiftDarwin.dylib. Redirect every weak Swift
+          # overlay for which the final app already embeds a High-Sierra-safe
+          # back-deployment dylib.
+          WEAK_SWIFT_OVERLAYS=(
+            "libswiftDarwin.dylib"
+            "libswiftObjectiveC.dylib"
+            "libswiftCoreFoundation.dylib"
+            "libswiftDispatch.dylib"
+            "libswiftXPC.dylib"
+            "libswiftIOKit.dylib"
+            "libswiftCoreMedia.dylib"
+            "libswiftMetal.dylib"
+            "libswiftCoreAudio.dylib"
+            "libswiftos.dylib"
+            "libswiftCoreImage.dylib"
+            "libswiftQuartzCore.dylib"
+          )
+
+          for LIB in "${WEAK_SWIFT_OVERLAYS[@]}"; do
+            EMBEDDED="$APP/Contents/Frameworks/$LIB"
+            OLD="/usr/lib/swift/$LIB"
+            NEW="@rpath/$LIB"
+
+            if [ ! -f "$EMBEDDED" ]; then
+              echo "ERROR: Required High Sierra Swift overlay missing: $EMBEDDED"
+              exit 1
+            fi
+
+            if otool -L "$BINARY" | grep -Fq "$OLD"; then
+              install_name_tool -change "$OLD" "$NEW" "$BINARY"
+            else
+              echo "ERROR: Expected FlutterMacOS weak Swift overlay dependency missing: $OLD"
+              exit 1
+            fi
+          done
+
+          # The two remaining modern overlays do not exist in the High Sierra
+          # back-deployment runtime. In this exact engine they carry only weak
+          # FORCE_LOAD imports, so leaving their LC_LOAD_WEAK_DYLIB system paths
+          # unresolved is safe. The ordinal audit below proves that no non-weak
+          # symbol is assigned to either of them.
+
           # Redirect FlutterMacOS's libobjc library ordinal to the High Sierra
           # compatibility umbrella. The shim re-exports the real libobjc, so
           # ordinary runtime symbols retain their two-level-namespace semantics.
@@ -3016,6 +3067,259 @@ jobs:
             echo "ERROR: FlutterMacOS no longer has the expected system libobjc dependency."
             exit 1
           fi
+
+          # Audit the Swift overlay dylib ordinals, not just the dylib names.
+          # High Sierra dyld reports a missing *dependent dylib ordinal* when a
+          # non-weak symbol is tied to an LC_LOAD_WEAK_DYLIB that could not load.
+          cat > ../diagnostics/audit_flutter_swift_ordinals.py <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          CPU_TYPE_X86_64 = 0x01000007
+          MH_MAGIC_64 = 0xFEEDFACF
+          LC_SYMTAB = 0x2
+          LC_ID_DYLIB = 0xD
+          LC_REQ_DYLD = 0x80000000
+          DYLIB_LOAD_BASE_CMDS = {0xC, 0x18, 0x1F, 0x20, 0x23}
+          N_EXT = 0x01
+          N_TYPE = 0x0E
+          N_UNDF = 0x00
+          N_SECT = 0x0E
+          N_WEAK_REF = 0x0040
+
+          TARGET_STDOUT = "_$s6Darwin6stdoutSpySo7__sFILEVGvg"
+
+          EXPECTED_RPATH_OVERLAYS = {
+              "@rpath/libswiftCore.dylib",
+              "@rpath/libswiftFoundation.dylib",
+              "@rpath/libswiftCoreGraphics.dylib",
+              "@rpath/libswiftDarwin.dylib",
+              "@rpath/libswiftObjectiveC.dylib",
+              "@rpath/libswiftCoreFoundation.dylib",
+              "@rpath/libswiftDispatch.dylib",
+              "@rpath/libswiftXPC.dylib",
+              "@rpath/libswiftIOKit.dylib",
+              "@rpath/libswiftCoreMedia.dylib",
+              "@rpath/libswiftMetal.dylib",
+              "@rpath/libswiftCoreAudio.dylib",
+              "@rpath/libswiftos.dylib",
+              "@rpath/libswiftCoreImage.dylib",
+              "@rpath/libswiftQuartzCore.dylib",
+          }
+
+          ALLOWED_WEAK_SYSTEM_OVERLAYS = {
+              "/usr/lib/swift/libswiftUniformTypeIdentifiers.dylib",
+              "/usr/lib/swift/libswiftOSLog.dylib",
+          }
+
+          def find_x86_slice(blob):
+              magic = blob[:4]
+              if magic == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack_from(">I", blob, 4)[0]
+                  for i in range(count):
+                      cputype, _sub, off, size, _align = struct.unpack_from(
+                          ">IIIII", blob, 8 + i * 20
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return off, size
+              elif magic == b"\xca\xfe\xba\xbf":
+                  count = struct.unpack_from(">I", blob, 4)[0]
+                  for i in range(count):
+                      cputype, _sub, off, size, _align, _reserved = struct.unpack_from(
+                          ">IIQQII", blob, 8 + i * 32
+                      )
+                      if cputype == CPU_TYPE_X86_64:
+                          return off, size
+              elif len(blob) >= 4 and struct.unpack_from("<I", blob, 0)[0] == MH_MAGIC_64:
+                  return 0, len(blob)
+              raise SystemExit("ERROR: Mach-O has no x86_64 slice.")
+
+          def parse_macho(path):
+              whole = Path(path).read_bytes()
+              slice_base, slice_size = find_x86_slice(whole)
+              blob = whole[slice_base:slice_base + slice_size]
+
+              if struct.unpack_from("<I", blob, 0)[0] != MH_MAGIC_64:
+                  raise SystemExit(f"ERROR: unsupported Mach-O slice in {path}.")
+
+              ncmds = struct.unpack_from("<I", blob, 16)[0]
+              off = 32
+              dylibs = []
+              symtab = None
+              install_id = None
+
+              for _ in range(ncmds):
+                  cmd, cmdsize = struct.unpack_from("<II", blob, off)
+                  base_cmd = cmd & ~LC_REQ_DYLD
+
+                  if base_cmd in DYLIB_LOAD_BASE_CMDS or cmd == LC_ID_DYLIB:
+                      nameoff = struct.unpack_from("<I", blob, off + 8)[0]
+                      end = blob.find(b"\0", off + nameoff, off + cmdsize)
+                      name = blob[off + nameoff:end].decode(errors="replace")
+                      if cmd == LC_ID_DYLIB:
+                          install_id = name
+                      elif base_cmd in DYLIB_LOAD_BASE_CMDS:
+                          dylibs.append((cmd, name))
+
+                  if cmd == LC_SYMTAB:
+                      symtab = struct.unpack_from("<IIII", blob, off + 8)
+
+                  off += cmdsize
+
+              symbols = []
+              if symtab is not None:
+                  symoff, nsyms, stroff, strsize = symtab
+                  for index in range(nsyms):
+                      pos = symoff + index * 16
+                      n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from(
+                          "<IBBHQ", blob, pos
+                      )
+                      if not (0 < n_strx < strsize):
+                          continue
+                      end = blob.find(b"\0", stroff + n_strx, stroff + strsize)
+                      name = blob[stroff + n_strx:end].decode(errors="replace")
+                      symbols.append(
+                          {
+                              "name": name,
+                              "type": n_type,
+                              "sect": n_sect,
+                              "desc": n_desc,
+                              "value": n_value,
+                              "ordinal": (n_desc >> 8) & 0xFF,
+                          }
+                      )
+
+              return dylibs, symbols, install_id
+
+          binary = Path(sys.argv[1])
+          frameworks = Path(sys.argv[2])
+          report_path = Path(sys.argv[3])
+
+          dylibs, symbols, _install_id = parse_macho(binary)
+          lines = ["FlutterMacOS direct dylib ordinals:"]
+
+          for ordinal, (cmd, name) in enumerate(dylibs, start=1):
+              lines.append(f"{ordinal:02d} cmd=0x{cmd:08x} {name}")
+
+          paths = {name for _cmd, name in dylibs}
+          missing = sorted(EXPECTED_RPATH_OVERLAYS - paths)
+          if missing:
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(
+                  "ERROR: expected embedded Swift overlay load commands are missing: "
+                  + ", ".join(missing)
+              )
+
+          undefined = [
+              symbol for symbol in symbols
+              if (symbol["type"] & N_EXT)
+              and (symbol["type"] & N_TYPE) == N_UNDF
+              and symbol["value"] == 0
+          ]
+
+          stdout_symbols = [
+              symbol for symbol in undefined
+              if symbol["name"] == TARGET_STDOUT
+          ]
+          if len(stdout_symbols) != 1:
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(
+                  f"ERROR: expected exactly one Darwin.stdout undefined symbol, "
+                  f"found {len(stdout_symbols)}."
+              )
+
+          stdout_symbol = stdout_symbols[0]
+          stdout_ordinal = stdout_symbol["ordinal"]
+          if not (1 <= stdout_ordinal <= len(dylibs)):
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(
+                  f"ERROR: Darwin.stdout has invalid library ordinal {stdout_ordinal}."
+              )
+
+          stdout_provider = dylibs[stdout_ordinal - 1][1]
+          lines.append(
+              f"Darwin.stdout ordinal={stdout_ordinal} provider={stdout_provider} "
+              f"n_desc=0x{stdout_symbol['desc']:04x}"
+          )
+
+          if stdout_provider != "@rpath/libswiftDarwin.dylib":
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(
+                  "ERROR: Darwin.stdout is not bound to the embedded "
+                  "@rpath/libswiftDarwin.dylib."
+              )
+
+          if stdout_symbol["desc"] & N_WEAK_REF:
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit("ERROR: Darwin.stdout unexpectedly became a weak reference.")
+
+          darwin = frameworks / "libswiftDarwin.dylib"
+          if not darwin.is_file():
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(f"ERROR: embedded Swift Darwin overlay missing: {darwin}")
+
+          _darwin_loads, darwin_symbols, darwin_id = parse_macho(darwin)
+          lines.append(f"embedded libswiftDarwin install_name={darwin_id}")
+
+          if darwin_id != "@rpath/libswiftDarwin.dylib":
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(
+                  "ERROR: embedded libswiftDarwin has an unexpected install name."
+              )
+
+          exported_stdout = [
+              symbol for symbol in darwin_symbols
+              if symbol["name"] == TARGET_STDOUT
+              and (symbol["type"] & N_EXT)
+              and (symbol["type"] & N_TYPE) == N_SECT
+              and symbol["value"] != 0
+          ]
+          if not exported_stdout:
+              report_path.write_text("\n".join(lines) + "\n")
+              raise SystemExit(
+                  "ERROR: embedded libswiftDarwin does not export the exact "
+                  "Darwin.stdout getter required by FlutterMacOS."
+              )
+
+          system_swift_ordinals = {}
+          for ordinal, (_cmd, name) in enumerate(dylibs, start=1):
+              if name.startswith("/usr/lib/swift/"):
+                  system_swift_ordinals[ordinal] = name
+
+          for ordinal, name in sorted(system_swift_ordinals.items()):
+              lines.append(f"remaining system Swift ordinal={ordinal}: {name}")
+              if name not in ALLOWED_WEAK_SYSTEM_OVERLAYS:
+                  report_path.write_text("\n".join(lines) + "\n")
+                  raise SystemExit(
+                      f"ERROR: unbackported direct system Swift overlay remains: {name}"
+                  )
+
+              bound = [symbol for symbol in undefined if symbol["ordinal"] == ordinal]
+              for symbol in bound:
+                  lines.append(
+                      f"  symbol={symbol['name']} n_desc=0x{symbol['desc']:04x}"
+                  )
+                  if not (symbol["desc"] & N_WEAK_REF):
+                      report_path.write_text("\n".join(lines) + "\n")
+                      raise SystemExit(
+                          "ERROR: a non-weak symbol is still bound to unavailable "
+                          f"High Sierra Swift overlay {name}: {symbol['name']}"
+                      )
+
+          report_path.write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          print(
+              "PASS: FlutterMacOS Swift two-level namespace ordinals are "
+              "High-Sierra-safe; Darwin.stdout resolves through the embedded "
+              "libswiftDarwin overlay."
+          )
+          PY
+
+          python3 ../diagnostics/audit_flutter_swift_ordinals.py \
+            "$BINARY" \
+            "$APP/Contents/Frameworks" \
+            ../diagnostics/FlutterMacOS.swift-ordinal-audit.txt
 
           # install_name_tool rewrites Mach-O load commands after the Metal
           # availability patches. Re-open the final binary and prove that
@@ -3741,6 +4045,15 @@ jobs:
               "macOS 10.12 and older."
           )
           PY
+
+          # Re-run the Swift two-level namespace audit against the final bundled
+          # FlutterMacOS. This catches packaging or later Mach-O edits that could
+          # silently restore /usr/lib/swift/libswiftDarwin.dylib and recreate the
+          # High Sierra lazy-binding failure.
+          python3 ../diagnostics/audit_flutter_swift_ordinals.py \
+            "$APP/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS" \
+            "$APP/Contents/Frameworks" \
+            ../diagnostics/final-FlutterMacOS.swift-ordinal-audit.txt
 
           # High Sierra's Objective-C runtime understands the pre-stable Swift
           # class discriminator (bit 0), not FAST_IS_SWIFT_STABLE (bit 1).
